@@ -1,0 +1,37 @@
+import asyncio
+# Python 3.14 patch
+asyncio.set_event_loop(asyncio.new_event_loop())
+
+from pyrogram import Client
+from pyrogram.enums import ChatType
+
+# 🚨 PUT YOUR NEW, RESET KEYS HERE 🚨
+api_id = "YOUR_API_ID"
+api_hash = "YOUR_API_HASH"
+
+app = Client("my_account", api_id=api_id, api_hash=api_hash)
+
+async def main():
+    print("\nLoading your chats (this might take a few seconds)...")
+    print("="*60)
+    
+    async with app:
+        async for dialog in app.get_dialogs():
+            # Filter for Groups, Supergroups, and Private DMs
+            if dialog.chat.type in [ChatType.GROUP, ChatType.SUPERGROUP, ChatType.PRIVATE]:
+                
+                # Handle naming logic
+                name = dialog.chat.title or dialog.chat.first_name
+                if dialog.chat.last_name:
+                     name += f" {dialog.chat.last_name}"
+                
+                # Tag it visually
+                tag = "[DM]" if dialog.chat.type == ChatType.PRIVATE else "[GROUP]"
+                
+                # Print the Name and the ID
+                print(f"{tag} {name}: {dialog.chat.id}")
+                
+    print("="*60)
+
+if __name__ == "__main__":
+    app.run(main())
