@@ -7,8 +7,8 @@ from pyrogram import Client, idle
 from pyrogram.handlers import MessageHandler
 
 # 🚨 PUT YOUR NEW, RESET KEYS HERE 🚨
-api_id = "38782884"       
-api_hash = "d5c53267a5244c82ec90dc3569996e82"   
+api_id = "API_ID"       # Paste your api_id here
+api_hash = "API_HASH"   # Paste your api_hash here
 
 app = Client("my_account", api_id=api_id, api_hash=api_hash)
 
