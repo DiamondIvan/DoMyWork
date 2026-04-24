@@ -1,6 +1,7 @@
 {
   "expo": {
     "name": "DoMyWork",
+    "owner": "DiamondIvan",
     "slug": "DoMyWork",
     "version": "1.0.0",
     "orientation": "portrait",

@@ -67,6 +67,10 @@ Status transitions:
   - `GOOGLE_OAUTH_CLIENT_SECRET`
   - `GOOGLE_OAUTH_REDIRECT_URI`
 
+> Important: `GOOGLE_OAUTH_REDIRECT_URI` must match the Expo redirect URI **exactly**.
+> For Expo Go with `useProxy: true`, it typically looks like `https://auth.expo.io/@YOUR_EXPO_USERNAME/DoMyWork`.
+> If this does not match what is configured in Google Cloud Console, Google will show **"Access blocked"** errors (often `redirect_uri_mismatch`).
+
 > Note: Getting refresh tokens requires an OAuth consent flow (user signs in). This repo only scaffolds the server-side execution.
 
 ## Local install (functions)
