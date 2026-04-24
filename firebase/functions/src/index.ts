@@ -8,8 +8,11 @@ if (
   require("dotenv").config({ path: "../../.env" });
 }
 
+import { enqueueAutomationRequest } from "./http/enqueueAutomationRequest";
 import { exchangeGoogleCode } from "./http/exchangeGoogleCode";
 import { onAutomationRequestCreated } from "./triggers/onAutomationRequestCreated";
 
-export { exchangeGoogleCode, onAutomationRequestCreated };
+export {
+  enqueueAutomationRequest, exchangeGoogleCode, onAutomationRequestCreated
+};
 
