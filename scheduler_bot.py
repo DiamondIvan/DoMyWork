@@ -1,6 +1,7 @@
 import os
 import asyncio
 import json
+import hashlib
 from typing import Any, Optional
 
 # Python 3.14 patch
@@ -33,8 +34,46 @@ else:
 # =====================================================================
 GLOBAL_TARGET_IDS = [
     -5131370378,  # Group
-    1088037939,      # DM
+    1088037939,   # DM
 ]
+
+# =====================================================================
+# Deduplication — skip images already processed this session
+# =====================================================================
+PROCESSED_IMAGE_HASHES: set = set()
+
+
+def calculate_file_hash(filepath: str) -> str:
+    """Returns an MD5 fingerprint of a file to detect duplicates."""
+    hasher = hashlib.md5()
+    with open(filepath, "rb") as f:
+        hasher.update(f.read())
+    return hasher.hexdigest()
+
+
+# =====================================================================
+# Media helpers
+# =====================================================================
+def extract_document_text(file_path: str) -> str:
+    """Extract plain text from PDF or Word documents."""
+    text = ""
+    try:
+        if file_path.lower().endswith(".pdf"):
+            import fitz  # type: ignore  (PyMuPDF)
+            doc = fitz.open(file_path)
+            for page in doc:
+                text += page.get_text() + "\n"
+        elif file_path.lower().endswith((".docx", ".doc")):
+            import docx  # type: ignore  (python-docx)
+            doc = docx.Document(file_path)
+            for para in doc.paragraphs:
+                text += para.text + "\n"
+        else:
+            text = "[Unsupported document format]"
+    except Exception as e:
+        print(f"❌ Error reading document: {e}")
+    return text.strip()
+
 
 # =====================================================================
 # Gemini AI (lazy init)
@@ -58,6 +97,23 @@ def _get_gemini():
     genai.configure(api_key=key)
     _GEMINI_MODEL = genai.GenerativeModel("gemini-2.0-flash")
     return _GEMINI_MODEL
+
+
+def describe_image_with_gemini(image_path: str) -> str:
+    """Ask Gemini to describe an image so we can store the description in Firestore."""
+    model = _get_gemini()
+    if model is None:
+        return "(image — AI disabled)"
+    try:
+        import PIL.Image  # type: ignore
+        with PIL.Image.open(image_path) as img:
+            response = model.generate_content(
+                ["Describe this image concisely in 1-2 sentences. Focus on any text, dates, events, or tasks visible.", img]
+            )
+        return response.text.strip()
+    except Exception as e:
+        print(f"⚠️ Image description error: {e}")
+        return "(image — description failed)"
 
 
 # =====================================================================
@@ -211,15 +267,19 @@ async def enqueue_automation_request(
 # AI Pipeline — Gemini reads full chat history and detects actions
 # =====================================================================
 _AI_PROMPT = """\
-You are an AI assistant monitoring a Telegram conversation called "{chat_title}".
+You are a strict scheduling assistant monitoring a Telegram conversation called "{chat_title}".
 
-Read the entire conversation below and decide if there is an actionable task to automate.
+Read the entire conversation below and decide if there is a MANDATORY actionable task to automate.
 
-Actionable tasks:
+DEFINITIONS:
+- MANDATORY: Project meetings, assignment deadlines, emails to send, calendar events to create. (Act on these)
+- PROMO_SPAM: Public festivals, club recruitment blasts, general advertisements, optional events. (Ignore these)
+
+Actionable tasks you can create:
 - Sending an email (e.g. "email John at john@example.com", "send a summary to someone")
 - Creating a calendar event (e.g. "meeting tomorrow 3pm", "schedule a call on Friday", "remind me at 5pm")
 
-If you detect an actionable task, respond with ONLY a valid JSON object in one of these exact formats:
+If you detect a MANDATORY actionable task, respond with ONLY a valid JSON object:
 
 Send email:
 {{"type": "send_email", "payload": {{"to": "email@example.com", "subject": "...", "bodyText": "..."}}}}
@@ -227,7 +287,7 @@ Send email:
 Create calendar event:
 {{"type": "create_calendar_event", "payload": {{"summary": "...", "description": "...", "start": "2026-04-24T15:00:00+08:00", "end": "2026-04-24T16:00:00+08:00", "attendees": []}}}}
 
-If there is NO new actionable task, respond with ONLY: null
+If there is NO new MANDATORY actionable task (or it is PROMO_SPAM), respond with ONLY: null
 
 Rules:
 - Reply with ONLY valid JSON or the word null — no markdown, no explanation.
@@ -301,21 +361,32 @@ async def process_message(client, message):
     media_type: Optional[str] = None
     media_file_name: Optional[str] = None
     has_media = False
+    is_image = False
 
-    if message.document:
-        has_media = True
-        media_type = "document"
-        media_file_name = message.document.file_name
-        print(f"📥 Downloading document from {sender}...")
-        os.makedirs("temp_downloads", exist_ok=True)
-        downloaded_file_path = await message.download(file_name="temp_downloads/")
-
-    elif message.photo:
+    if message.photo:
         has_media = True
         media_type = "photo"
+        is_image = True
         print(f"📥 Downloading photo from {sender}...")
-        os.makedirs("temp_downloads", exist_ok=True)
-        downloaded_file_path = await message.download(file_name="temp_downloads/")
+        os.makedirs("temp_downloads/images", exist_ok=True)
+        downloaded_file_path = await message.download(file_name="temp_downloads/images/")
+
+    elif message.document:
+        has_media = True
+        media_file_name = message.document.file_name or "unknown_file"
+        fname_lower = media_file_name.lower()
+
+        if fname_lower.endswith((".jpg", ".jpeg", ".png", ".webp")):
+            media_type = "photo"
+            is_image = True
+            print(f"📥 Downloading image document from {sender}...")
+            os.makedirs("temp_downloads/images", exist_ok=True)
+            downloaded_file_path = await message.download(file_name="temp_downloads/images/")
+        else:
+            media_type = "document"
+            print(f"📥 Downloading document from {sender}...")
+            os.makedirs("temp_downloads/docs", exist_ok=True)
+            downloaded_file_path = await message.download(file_name="temp_downloads/docs/")
 
     # --- Console log ---
     direction_emoji = "➡️ [OUTGOING]" if message.outgoing else "⬅️ [INCOMING]"
@@ -323,14 +394,45 @@ async def process_message(client, message):
     display = f"{media_tag}{content}" if content else f"{media_tag}(No text/caption)"
     print(f"\n{direction_emoji} [{chat_title}] {sender}: {display}")
 
-    # 1. Save message to Firestore immediately
+    # --- Deduplication check for images ---
+    if downloaded_file_path and is_image:
+        fingerprint = calculate_file_hash(downloaded_file_path)
+        if fingerprint in PROCESSED_IMAGE_HASHES:
+            print("🚫 Duplicate image — skipping AI to save quota.")
+            os.remove(downloaded_file_path)
+            return
+        PROCESSED_IMAGE_HASHES.add(fingerprint)
+
+    # --- Enrich text with AI description for media ---
+    # For images: ask Gemini to describe the image (so it gets stored + used in history)
+    # For documents: extract raw text
+    enriched_text = content
+    if downloaded_file_path:
+        if is_image:
+            print("🧠 Describing image with Gemini...")
+            description = await asyncio.to_thread(describe_image_with_gemini, downloaded_file_path)
+            enriched_text = f"{content}\n[Image description: {description}]".strip()
+            print(f"🖼️ Image described: {description}")
+        else:
+            print("📄 Extracting document text...")
+            doc_text = await asyncio.to_thread(extract_document_text, downloaded_file_path)
+            enriched_text = f"{content}\n[Document content: {doc_text[:1000]}]".strip()
+
+        # Clean up temp file after extraction
+        try:
+            os.remove(downloaded_file_path)
+            print("🗑️ Temp file deleted.")
+        except Exception:
+            pass
+
+    # 1. Save message to Firestore immediately (with enriched text for media)
     await save_message(
         chat_id=chat_id,
         chat_title=chat_title,
         sender=sender,
         sender_id=sender_id,
         direction=direction,
-        text=content,
+        text=enriched_text,
         has_media=has_media,
         media_type=media_type,
         media_file_name=media_file_name,
@@ -367,11 +469,6 @@ async def process_message(client, message):
                 print(f"🔥 Enqueued automationRequests/{request_id} ({req_type})")
             else:
                 print("⚠️ Failed to enqueue (Firebase not configured?)")
-
-    # 3. Handle downloaded file
-    if downloaded_file_path:
-        print(f"✅ File saved at: {downloaded_file_path}")
-        # os.remove(downloaded_file_path)  # Uncomment to auto-delete after processing
 
 
 # =====================================================================
