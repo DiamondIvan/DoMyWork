@@ -7,7 +7,6 @@ import fitz  # PyMuPDF for PDFs
 import docx  # python-docx for Word files
 from datetime import datetime
 
-=======
 import os
 import asyncio
 import json
