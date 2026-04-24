@@ -5,11 +5,24 @@ asyncio.set_event_loop(asyncio.new_event_loop())
 from pyrogram import Client
 from pyrogram.enums import ChatType
 
-# 🚨 PUT YOUR NEW, RESET KEYS HERE 🚨
-api_id = "YOUR_API_ID"
-api_hash = "YOUR_API_HASH"
+from env_config import get_env, get_env_int
 
-app = Client("my_account", api_id=api_id, api_hash=api_hash)
+# Telegram API credentials (loaded from .env)
+api_id = get_env_int("TELEGRAM_API_ID", fallback_names=["api_id"])
+api_hash = get_env("TELEGRAM_API_HASH", fallback_names=["api_hash"])
+
+session_name = get_env("PYROGRAM_SESSION_NAME", default="my_account")
+session_string = get_env("PYROGRAM_SESSION_STRING")
+
+if session_string:
+    app = Client(session_name, session_string=session_string)
+else:
+    if api_id is None or not api_hash:
+        raise RuntimeError(
+            "Missing Telegram credentials. Set TELEGRAM_API_ID and TELEGRAM_API_HASH in .env "
+            "(or api_id/api_hash)."
+        )
+    app = Client(session_name, api_id=api_id, api_hash=api_hash)
 
 async def main():
     print("\nLoading your chats (this might take a few seconds)...")
@@ -34,4 +47,7 @@ async def main():
     print("="*60)
 
 if __name__ == "__main__":
-    app.run(main())
+    try:
+        app.run(main())
+    except KeyboardInterrupt:
+        print("\nCancelled login. Re-run and enter your phone number (with +countrycode) or bot token when prompted.")

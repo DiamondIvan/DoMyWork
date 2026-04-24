@@ -3,5 +3,7 @@
     "source.fixAll": "explicit",
     "source.organizeImports": "explicit",
     "source.sortMembers": "explicit"
-  }
+  },
+  "python.envFile": "${workspaceFolder}/.env",
+  "python.terminal.useEnvFile": true
 }
