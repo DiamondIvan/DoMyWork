@@ -1,3 +1,13 @@
+import asyncio
+import os
+import hashlib # NEW: Used for creating image fingerprints
+import google.generativeai as genai
+import PIL.Image
+import fitz  # PyMuPDF for PDFs
+import docx  # python-docx for Word files
+from datetime import datetime
+
+=======
 import os
 import asyncio
 import json
