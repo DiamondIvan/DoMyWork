@@ -3,6 +3,13 @@
 # dependencies
 node_modules/
 
+# Firebase Functions build output
+/firebase/functions/lib/
+/firebase/functions/.tsbuildinfo
+
+# Firebase local emulator artifacts
+.firebase/
+
 # Expo
 .expo/
 dist/
@@ -31,7 +38,16 @@ yarn-error.*
 *.pem
 
 # local env files
+.env
+.env.*
+!.env.example
 .env*.local
+
+# Firebase
+/firebase/functions/node_modules/
+/firebase/functions/lib/
+/firebase/functions/.tsbuildinfo
+.firebase/
 
 # typescript
 *.tsbuildinfo
