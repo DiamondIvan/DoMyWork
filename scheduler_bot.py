@@ -4,10 +4,11 @@ import json
 import hashlib
 from typing import Any, Optional
 import requests
+import base64
+from env_config import get_env
 # Python 3.14 patch
 asyncio.set_event_loop(asyncio.new_event_loop())
 import base64
-from openai import OpenAI # Ensure this is at the top
 from pyrogram import Client, idle
 from pyrogram.handlers import MessageHandler
 
@@ -104,31 +105,56 @@ def call_ilmu_ai(system_prompt: str, user_content: str) -> Optional[str]:
         return None
 
 # =====================================================================
-# GPT-4o-mini Integration (Replacement for Ilmu/Gemini)
+# Gemini to describe iamge
 # =====================================================================
-OPENAI_API_KEY = get_env("OPENAI_API_KEY")
-gpt_client = OpenAI(api_key=OPENAI_API_KEY)
+import base64
+import requests
+from env_config import get_env
 
-def describe_image_with_gpt(image_path: str) -> str:
-    """Uses GPT-4o-mini to actually see and describe the image."""
+def describe_image_with_gemini(image_path: str) -> str:
+    """Uses Gemini 2.5 Flash to actually see and describe the image."""
+    api_key = get_env("GEMINI_API_KEY")
+    if not api_key:
+        print("⚠️ [GEMINI VISION]: GEMINI_API_KEY is missing from .env!")
+        return "(Image received - API Key missing)"
+
     try:
+        # 1. Determine basic mime type for Gemini
+        mime_type = "image/png" if image_path.lower().endswith(".png") else "image/jpeg"
+        
+        # 2. Encode image to Base64
         with open(image_path, "rb") as image_file:
             base64_image = base64.b64encode(image_file.read()).decode('utf-8')
 
-        response = gpt_client.chat.completions.create(
-            model="gpt-4o-mini",
-            messages=[{
-                "role": "user",
-                "content": [
-                    {"type": "text", "text": "What is in this image? Focus on dates, times, and tasks for a calendar."},
-                    {"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{base64_image}"}}
-                ],
-            }],
-            max_tokens=300
-        )
-        return response.choices[0].message.content
+        # 3. Setup Gemini API URL and Payload
+        url = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent?key={api_key}"
+        
+        payload = {
+            "contents": [{
+                "parts": [
+                    {"text": "What is in this image? Focus on dates, times, and tasks for a calendar. Keep it concise."},
+                    {
+                        "inline_data": {
+                            "mime_type": mime_type,
+                            "data": base64_image
+                        }
+                    }
+                ]
+            }]
+        }
+        
+        # 4. Make the request
+        response = requests.post(url, headers={"Content-Type": "application/json"}, json=payload, timeout=30)
+        
+        if response.status_code == 200:
+            # Parse the text out of Gemini's specific JSON structure
+            return response.json()['candidates'][0]['content']['parts'][0]['text'].strip()
+        else:
+            print(f"⚠️ [GEMINI API ERROR]: {response.status_code} - {response.text}")
+            return "(Image received - Gemini API error)"
+
     except Exception as e:
-        print(f"❌ [GPT VISION ERROR]: {e}")
+        print(f"❌ [GEMINI VISION ERROR]: {e}")
         return "(Image received - failed to describe)"
 # =====================================================================
 # Firestore (lazy init)
@@ -396,7 +422,7 @@ async def process_message(client, message):
     if downloaded_file_path:
         if is_image:
             print("🧠 Describing image with Gemini...")
-            description = await asyncio.to_thread(describe_image_with_gpt, downloaded_file_path)
+            description = await asyncio.to_thread(describe_image_with_gemini, downloaded_file_path)
             enriched_text = f"{content}\n[Image description: {description}]".strip()
             print(f"🖼️ Image described: {description}")
         else:
