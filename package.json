@@ -3,12 +3,14 @@
   "main": "node_modules/expo/AppEntry.js",
   "version": "1.0.0",
   "scripts": {
-    "dev": "expo start",
-    "start": "expo start",
+    "api": ".venv\\Scripts\\uvicorn telegram_api:app --reload --host 0.0.0.0 --port 8000",
+    "bot": ".venv\\Scripts\\python.exe -X utf8 -u scheduler_bot.py",
+    "dev": "concurrently --names \"api,bot,expo\" --prefix-colors \"cyan,yellow,magenta\" \"npm run api\" \"npm run bot\" \"expo start\"",
+    "start": "concurrently --names \"api,bot,expo\" --prefix-colors \"cyan,yellow,magenta\" \"npm run api\" \"npm run bot\" \"expo start\"",
     "reset-project": "node ./scripts/reset-project.js",
-    "android": "expo start --android",
-    "ios": "expo start --ios",
-    "web": "expo start --web",
+    "android": "concurrently --names \"api,bot,expo\" --prefix-colors \"cyan,yellow,magenta\" \"npm run api\" \"npm run bot\" \"expo start --android\"",
+    "ios": "concurrently --names \"api,bot,expo\" --prefix-colors \"cyan,yellow,magenta\" \"npm run api\" \"npm run bot\" \"expo start --ios\"",
+    "web": "concurrently --names \"api,bot,expo\" --prefix-colors \"cyan,yellow,magenta\" \"npm run api\" \"npm run bot\" \"expo start --web\"",
     "lint": "expo lint"
   },
   "dependencies": {
@@ -17,6 +19,7 @@
     "@react-navigation/bottom-tabs": "^7.4.0",
     "@react-navigation/elements": "^2.6.3",
     "@react-navigation/native": "^7.1.8",
+    "dotenv": "^17.4.2",
     "expo": "~54.0.33",
     "expo-auth-session": "~7.0.10",
     "expo-constants": "~18.0.13",
@@ -44,6 +47,7 @@
   },
   "devDependencies": {
     "@types/react": "~19.1.0",
+    "concurrently": "^9.2.1",
     "eslint": "^9.25.0",
     "eslint-config-expo": "~10.0.0",
     "expo-module-scripts": "^55.0.2",

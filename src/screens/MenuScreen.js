@@ -1,24 +1,106 @@
-import { useEffect, useMemo, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import {
-  Alert,
-  Image,
-  Linking,
-  ScrollView,
-  StyleSheet,
-  Text,
-  TextInput,
-  TouchableOpacity,
-  View,
+    Alert,
+    Image,
+    Linking,
+    ScrollView,
+    StyleSheet,
+    Text,
+    TextInput,
+    TouchableOpacity,
+    View,
 } from "react-native";
 import { defaultUserId, enqueueAutomationRequest } from "../constants/backend";
 import { COLORS } from "../constants/theme";
 import { useActivityStore } from "../store/ActivityProvider";
+
+const BASE_URL = "http://10.167.66.131:8000";
 
 const MenuScreen = () => {
   const [currentTime, setCurrentTime] = useState(new Date());
   const [searchQuery, setSearchQuery] = useState("");
   const [selectedFilters, setSelectedFilters] = useState([]);
   const { state, actions } = useActivityStore();
+
+  // ── Live pending tasks from Firestore (via API polling) ──
+  const [firestorePending, setFirestorePending] = useState([]);
+  const [confirmingId, setConfirmingId] = useState(null);
+  const pollRef = useRef(null);
+
+  const fetchPending = useCallback(async () => {
+    try {
+      const res = await fetch(`${BASE_URL}/pendingTasks`);
+      if (!res.ok) return;
+      const json = await res.json();
+      setFirestorePending(json.tasks ?? []);
+    } catch {
+      /* silent — network may not be ready yet */
+    }
+  }, []);
+
+  useEffect(() => {
+    fetchPending();
+    pollRef.current = setInterval(fetchPending, 10_000);
+    return () => clearInterval(pollRef.current);
+  }, [fetchPending]);
+
+  const handleConfirm = async (task) => {
+    setConfirmingId(task.id);
+    try {
+      const res = await fetch(`${BASE_URL}/pendingTasks/${task.id}/confirm`, {
+        method: "POST",
+      });
+      const json = await res.json().catch(() => null);
+      console.log("[Confirm] response:", res.status, JSON.stringify(json));
+
+      if (res.ok) {
+        setFirestorePending((prev) => prev.filter((t) => t.id !== task.id));
+
+        const eventId = json?.calendarEventId;
+        const eventLink = json?.calendarEventLink;  // direct link to the created event
+        // Fallback: open calendar home if no direct link
+        const openUrl = eventLink || "https://calendar.google.com/calendar/u/0/r";
+
+        Alert.alert(
+          eventId ? "✅ Event Created" : "Task Confirmed",
+          eventId
+            ? `Event "${task.title}" was added to Google Calendar.\n\nTap "Open Event" to view it. Make sure you're signed in to the same Google account used in Settings.`
+            : `"${task.title}" has been queued — it will be processed shortly by the backend.`,
+          [
+            {
+              text: eventId ? "Open Event" : "Open Calendar",
+              onPress: async () => {
+                const canOpen = await Linking.canOpenURL(openUrl);
+                if (canOpen) {
+                  await Linking.openURL(openUrl);
+                } else {
+                  await Linking.openURL("https://calendar.google.com/calendar/u/0/r");
+                }
+              },
+            },
+            { text: "OK", style: "cancel" },
+          ],
+        );
+      } else {
+        // Surface the actual error from the backend
+        const detail = json?.detail ?? `Server error ${res.status}`;
+        Alert.alert("❌ Confirm Failed", detail);
+      }
+    } catch (e) {
+      Alert.alert("Error", e?.message ?? "Network error — is the backend running?");
+    } finally {
+      setConfirmingId(null);
+    }
+  };
+
+  const handleDismiss = async (task) => {
+    try {
+      await fetch(`${BASE_URL}/pendingTasks/${task.id}`, { method: "DELETE" });
+      setFirestorePending((prev) => prev.filter((t) => t.id !== task.id));
+    } catch {
+      /* ignore */
+    }
+  };
   const [messages] = useState([
     {
       id: 1,
@@ -102,12 +184,28 @@ const MenuScreen = () => {
     );
   };
 
+  // Merge Firestore pending tasks + local ActivityStore pending items
   const pendingItems = useMemo(() => {
-    return state.items
+    const local = state.items
       .filter((it) => it.status === "pending")
-      .slice()
-      .sort((a, b) => (b.createdAtISO || "").localeCompare(a.createdAtISO || ""));
-  }, [state.items]);
+      .map((it) => ({ ...it, _source: "local" }));
+    const remote = firestorePending.map((t) => ({
+      id: t.id,
+      title: t.title,
+      dateISO: t.createdAt ? t.createdAt.slice(0, 10) : "",
+      timeLabel: "",
+      chatTitle: t.chatTitle,
+      taskType: t.type,
+      payload: t.payload,
+      _source: "firestore",
+      _raw: t,
+    }));
+    return [...remote, ...local].sort((a, b) =>
+      (b.createdAt || b.dateISO || "").localeCompare(
+        a.createdAt || a.dateISO || "",
+      ),
+    );
+  }, [state.items, firestorePending]);
 
   const openGoogleCalendar = async () => {
     const url = "https://calendar.google.com";
@@ -134,7 +232,9 @@ const MenuScreen = () => {
     });
 
     const completed = state.items.filter((it) => it.status === "completed");
-    const counts = days.map((iso) => completed.filter((it) => it.dateISO === iso).length);
+    const counts = days.map(
+      (iso) => completed.filter((it) => it.dateISO === iso).length,
+    );
     return counts;
   }, [state.items]);
 
@@ -271,26 +371,69 @@ const MenuScreen = () => {
 
         <Text style={styles.sectionTitle}>Pending Confirmation</Text>
         {pendingItems.length === 0 && (
-          <Text style={styles.emptyText}>No pending items right now.</Text>
+          <Text style={styles.emptyText}>
+            No pending items — AI is watching your selected chats.
+          </Text>
         )}
         {pendingItems.map((it) => (
           <View key={it.id} style={styles.card}>
+            {it.chatTitle ? (
+              <Text style={styles.cardSource}>From: {it.chatTitle}</Text>
+            ) : null}
             <Text style={styles.cardTime}>
               {it.dateISO} {it.timeLabel || ""}
             </Text>
             <Text style={styles.cardTask}>{it.title}</Text>
+            {it.taskType === "create_calendar_event" && it.payload && (
+              <View style={styles.payloadBox}>
+                {it.payload.start ? (
+                  <Text style={styles.payloadText}>
+                    🗓 {it.payload.start?.replace("T", "  ")}
+                  </Text>
+                ) : null}
+                {it.payload.description ? (
+                  <Text style={styles.payloadText} numberOfLines={2}>
+                    📝 {it.payload.description}
+                  </Text>
+                ) : null}
+              </View>
+            )}
+            {it.taskType === "send_email" && it.payload && (
+              <View style={styles.payloadBox}>
+                <Text style={styles.payloadText}>✉️ To: {it.payload.to}</Text>
+                {it.payload.bodyText ? (
+                  <Text style={styles.payloadText} numberOfLines={2}>
+                    {it.payload.bodyText}
+                  </Text>
+                ) : null}
+              </View>
+            )}
             <View style={styles.btnRow}>
               <TouchableOpacity
-                style={styles.btnConfirm}
-                onPress={() => actions.confirmPending(it.id)}
+                style={[
+                  styles.btnConfirm,
+                  confirmingId === it.id && { opacity: 0.6 },
+                ]}
+                disabled={confirmingId === it.id}
+                onPress={() =>
+                  it._source === "firestore"
+                    ? handleConfirm(it._raw)
+                    : actions.confirmPending(it.id)
+                }
               >
-                <Text style={styles.btnConfirmText}>✓ Confirm</Text>
+                <Text style={styles.btnConfirmText}>
+                  {confirmingId === it.id ? "Confirming..." : "✓ Confirm"}
+                </Text>
               </TouchableOpacity>
               <TouchableOpacity
                 style={styles.btnCancel}
-                onPress={() => actions.deleteItem(it.id)}
+                onPress={() =>
+                  it._source === "firestore"
+                    ? handleDismiss(it._raw)
+                    : actions.deleteItem(it.id)
+                }
               >
-                <Text style={styles.btnCancelText}>✕ Cancel</Text>
+                <Text style={styles.btnCancelText}>✕ Dismiss</Text>
               </TouchableOpacity>
             </View>
           </View>
@@ -336,9 +479,13 @@ const MenuScreen = () => {
           <View style={styles.miniCard}>
             <Text style={styles.miniCardTitle}>Statistic</Text>
             <View style={styles.statRow}>
-              <Text style={styles.statText}>Telegram: {sourceCounts.telegram}</Text>
+              <Text style={styles.statText}>
+                Telegram: {sourceCounts.telegram}
+              </Text>
               <Text style={styles.statText}>Email: {sourceCounts.email}</Text>
-              <Text style={styles.statText}>Spectrum: {sourceCounts.spectrum}</Text>
+              <Text style={styles.statText}>
+                Spectrum: {sourceCounts.spectrum}
+              </Text>
             </View>
             <View style={styles.graphRow}>
               {weeklyStats.map((point, index) => (
@@ -501,6 +648,26 @@ const styles = StyleSheet.create({
     fontWeight: "700",
     marginVertical: 8,
     color: COLORS.darkGray,
+  },
+  cardSource: {
+    fontSize: 11,
+    fontWeight: "700",
+    color: COLORS.primary,
+    textTransform: "uppercase",
+    letterSpacing: 0.4,
+    marginBottom: 2,
+  },
+  payloadBox: {
+    backgroundColor: "#f1f5f9",
+    borderRadius: 8,
+    padding: 8,
+    marginBottom: 6,
+    gap: 4,
+  },
+  payloadText: {
+    fontSize: 12,
+    color: COLORS.darkGray,
+    fontWeight: "500",
   },
   btnRow: {
     flexDirection: "row",
