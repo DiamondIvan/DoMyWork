@@ -1,7 +1,7 @@
+import AsyncStorage from "@react-native-async-storage/async-storage";
 import * as AuthSession from "expo-auth-session";
 import * as WebBrowser from "expo-web-browser";
 import { useEffect, useMemo, useState } from "react";
-import AsyncStorage from "@react-native-async-storage/async-storage";
 import {
   Alert,
   Image,
@@ -58,7 +58,7 @@ export default function SettingScreen() {
       if (val) setSavedSessionString(val);
     });
     // Load previously saved selection from the backend
-    fetch(`${"http://10.167.66.131:8000"}/telegram/selectedChats`)
+    fetch(`${telegramApiBaseUrl}/telegram/selectedChats`)
       .then((r) => r.json())
       .then((json) => {
         if (Array.isArray(json.chatIds)) {
@@ -69,7 +69,12 @@ export default function SettingScreen() {
   }, []);
 
   const googleClientId = process.env.EXPO_PUBLIC_GOOGLE_OAUTH_CLIENT_ID ?? "";
-  const functionsBaseUrl = "http://10.167.66.131:8000";
+  const functionsBaseUrl = (
+    process.env.EXPO_PUBLIC_FUNCTIONS_BASE_URL ?? ""
+  ).replace(/\/$/, "");
+  const telegramApiBaseUrl = (
+    process.env.EXPO_PUBLIC_TELEGRAM_API_URL ?? "http://10.167.66.131:8000"
+  ).replace(/\/$/, "");
   const redirectUri = useMemo(() => {
     const rawUri =
       process.env.EXPO_PUBLIC_GOOGLE_OAUTH_REDIRECT_URI ??
@@ -174,17 +179,19 @@ export default function SettingScreen() {
   const sendTelegramCode = async () => {
     setTelegramStatus("");
     if (!telegramPhone.trim()) {
-      setTelegramStatus("Please enter your phone number with country code (e.g. +60123456789).");
+      setTelegramStatus(
+        "Please enter your phone number with country code (e.g. +60123456789).",
+      );
       return;
     }
-    if (!functionsBaseUrl) {
-      setTelegramStatus("Missing EXPO_PUBLIC_FUNCTIONS_BASE_URL");
+    if (!telegramApiBaseUrl) {
+      setTelegramStatus("Missing EXPO_PUBLIC_TELEGRAM_API_URL");
       return;
     }
 
     setIsTelegramLoading(true);
     try {
-      const res = await fetch(`${functionsBaseUrl}/telegram/sendCode`, {
+      const res = await fetch(`${telegramApiBaseUrl}/telegram/sendCode`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
@@ -194,11 +201,15 @@ export default function SettingScreen() {
       });
       const json = await res.json().catch(() => null);
       if (!res.ok) {
-        setTelegramStatus(json?.detail ?? `Failed to send code (${res.status}).`);
+        setTelegramStatus(
+          json?.detail ?? `Failed to send code (${res.status}).`,
+        );
         return;
       }
       setTelegramPhoneCodeHash(json.phoneCodeHash);
-      setTelegramStatus("✅ Code sent! Check your Telegram app and enter the code below.");
+      setTelegramStatus(
+        "✅ Code sent! Check your Telegram app and enter the code below.",
+      );
     } catch (error) {
       setTelegramStatus(error?.message ?? "Failed to reach backend.");
     } finally {
@@ -212,7 +223,7 @@ export default function SettingScreen() {
     setIsFetchingChats(true);
     setChatSaveStatus("");
     try {
-      const res = await fetch(`${functionsBaseUrl}/telegram/fetchChats`, {
+      const res = await fetch(`${telegramApiBaseUrl}/telegram/fetchChats`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ sessionString: savedSessionString }),
@@ -240,12 +251,14 @@ export default function SettingScreen() {
     setSelectedChatIds(next);
     // Persist immediately
     try {
-      await fetch(`${functionsBaseUrl}/telegram/selectedChats`, {
+      await fetch(`${telegramApiBaseUrl}/telegram/selectedChats`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ chatIds: Array.from(next) }),
       });
-      setChatSaveStatus(`${next.size} chat(s) selected — bot will listen to these.`);
+      setChatSaveStatus(
+        `${next.size} chat(s) selected — bot will listen to these.`,
+      );
     } catch {
       setChatSaveStatus("Could not save selection.");
     }
@@ -268,7 +281,7 @@ export default function SettingScreen() {
 
     setIsTelegramLoading(true);
     try {
-      const res = await fetch(`${functionsBaseUrl}/telegram/signIn`, {
+      const res = await fetch(`${telegramApiBaseUrl}/telegram/signIn`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
@@ -287,18 +300,24 @@ export default function SettingScreen() {
 
       if (json.status === "password_needed") {
         setIsPasswordNeeded(true);
-        setTelegramStatus(json.detail || "Two-step verification enabled. Please enter your password.");
+        setTelegramStatus(
+          json.detail ||
+            "Two-step verification enabled. Please enter your password.",
+        );
         return;
       }
 
       // Save session string to AsyncStorage so the whole app can use it
       if (json.sessionString) {
-        await AsyncStorage.setItem("crow.telegram.sessionString", json.sessionString);
+        await AsyncStorage.setItem(
+          "crow.telegram.sessionString",
+          json.sessionString,
+        );
         setSavedSessionString(json.sessionString);
       }
 
       setTelegramStatus(
-        "Telegram connected! Session saved — the app can now access your Telegram."
+        "Telegram connected! Session saved — the app can now access your Telegram.",
       );
       setTelegramPhoneCodeHash(null);
       setIsPasswordNeeded(false);
@@ -350,15 +369,27 @@ export default function SettingScreen() {
         return;
       }
 
-      const res = await fetch(`${functionsBaseUrl}/exchangeGoogleCode`, {
+      const exchangeUrl = `${functionsBaseUrl}/exchangeGoogleCode`;
+      const res = await fetch(exchangeUrl, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ userId: userId.trim(), code, redirectUri }),
       });
 
-      const json = await res.json().catch(() => null);
+      const raw = await res.text();
+      let json = null;
+      try {
+        json = raw ? JSON.parse(raw) : null;
+      } catch {
+        json = null;
+      }
       if (!res.ok) {
-        setStatusText(json?.error ?? `Exchange failed (${res.status}).`);
+        const responseSnippet =
+          typeof raw === "string" ? raw.slice(0, 120).trim() : "";
+        setStatusText(
+          json?.error ??
+            `Exchange failed (${res.status}) at ${exchangeUrl}${responseSnippet ? `: ${responseSnippet}` : ""}`,
+        );
         return;
       }
 
@@ -528,7 +559,8 @@ export default function SettingScreen() {
                   <View style={styles.twofaBanner}>
                     <Text style={styles.twofaIcon}>🔐</Text>
                     <Text style={styles.twofaText}>
-                      Two-step verification is enabled. Enter your Telegram password below.
+                      Two-step verification is enabled. Enter your Telegram
+                      password below.
                     </Text>
                   </View>
                   <TextInput
@@ -552,17 +584,23 @@ export default function SettingScreen() {
                 ]}
               >
                 <Text style={styles.connectGoogleText}>
-                  {isTelegramLoading ? "Signing in..." : "Verify & Connect Telegram"}
+                  {isTelegramLoading
+                    ? "Signing in..."
+                    : "Verify & Connect Telegram"}
                 </Text>
               </Pressable>
             </>
           )}
 
-          {!!telegramStatus && <Text style={styles.statusText}>{telegramStatus}</Text>}
+          {!!telegramStatus && (
+            <Text style={styles.statusText}>{telegramStatus}</Text>
+          )}
 
           {savedSessionString && (
             <View style={styles.connectedBadge}>
-              <Text style={styles.connectedBadgeText}>Connected to Telegram</Text>
+              <Text style={styles.connectedBadgeText}>
+                Connected to Telegram
+              </Text>
             </View>
           )}
         </View>
@@ -573,18 +611,26 @@ export default function SettingScreen() {
             <Text style={styles.sectionTitle}>Monitored Chats</Text>
             <View style={styles.cardPlain}>
               <Text style={styles.chatPickerHint}>
-                Choose which chats the AI bot listens to. Only messages from selected chats use AI tokens.
+                Choose which chats the AI bot listens to. Only messages from
+                selected chats use AI tokens.
               </Text>
               <Pressable
                 onPress={fetchChatsForPicker}
                 disabled={isFetchingChats}
                 style={({ pressed }) => [
                   styles.connectGoogleBtn,
-                  { opacity: isFetchingChats ? 0.6 : pressed ? 0.85 : 1, marginTop: 10 },
+                  {
+                    opacity: isFetchingChats ? 0.6 : pressed ? 0.85 : 1,
+                    marginTop: 10,
+                  },
                 ]}
               >
                 <Text style={styles.connectGoogleText}>
-                  {isFetchingChats ? "Loading chats..." : chatList.length > 0 ? "Refresh Chat List" : "Load My Chats"}
+                  {isFetchingChats
+                    ? "Loading chats..."
+                    : chatList.length > 0
+                      ? "Refresh Chat List"
+                      : "Load My Chats"}
                 </Text>
               </Pressable>
 
@@ -595,15 +641,25 @@ export default function SettingScreen() {
                     return (
                       <TouchableOpacity
                         key={chat.id}
-                        style={[styles.chatRow, isSelected && styles.chatRowSelected]}
+                        style={[
+                          styles.chatRow,
+                          isSelected && styles.chatRowSelected,
+                        ]}
                         onPress={() => toggleChatSelection(chat.id)}
                         activeOpacity={0.7}
                       >
                         <View style={styles.chatCheckbox}>
-                          {isSelected && <View style={styles.chatCheckboxInner} />}
+                          {isSelected && (
+                            <View style={styles.chatCheckboxInner} />
+                          )}
                         </View>
                         <View style={{ flex: 1 }}>
-                          <Text style={[styles.chatName, isSelected && styles.chatNameSelected]}>
+                          <Text
+                            style={[
+                              styles.chatName,
+                              isSelected && styles.chatNameSelected,
+                            ]}
+                          >
                             {chat.name}
                           </Text>
                           {chat.lastMessage ? (
@@ -613,7 +669,10 @@ export default function SettingScreen() {
                           ) : null}
                         </View>
                         <Text style={styles.chatTypeTag}>
-                          {chat.type?.includes("group") || chat.type?.includes("super") ? "GROUP" : "DM"}
+                          {chat.type?.includes("group") ||
+                          chat.type?.includes("super")
+                            ? "GROUP"
+                            : "DM"}
                         </Text>
                       </TouchableOpacity>
                     );

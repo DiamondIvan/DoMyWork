@@ -109,7 +109,8 @@ export default function TabTwoScreen() {
         return;
       }
 
-      const res = await fetch(`${functionsBaseUrl}/exchangeGoogleCode`, {
+      const exchangeUrl = `${functionsBaseUrl}/exchangeGoogleCode`;
+      const res = await fetch(exchangeUrl, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
@@ -119,9 +120,20 @@ export default function TabTwoScreen() {
         }),
       });
 
-      const json = (await res.json().catch(() => null)) as any;
+      const raw = await res.text();
+      let json: any = null;
+      try {
+        json = raw ? JSON.parse(raw) : null;
+      } catch {
+        json = null;
+      }
       if (!res.ok) {
-        setStatusText(json?.error ?? `Exchange failed (${res.status}).`);
+        const responseSnippet =
+          typeof raw === "string" ? raw.slice(0, 120).trim() : "";
+        setStatusText(
+          json?.error ??
+            `Exchange failed (${res.status}) at ${exchangeUrl}${responseSnippet ? `: ${responseSnippet}` : ""}`,
+        );
         return;
       }
 

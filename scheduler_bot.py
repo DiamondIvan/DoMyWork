@@ -115,9 +115,18 @@ def extract_document_text(file_path: str) -> str:
 
 
 # =====================================================================
+# Owner user ID — must match the userId used when connecting Google OAuth
+# =====================================================================
+OWNER_USER_ID = (
+    get_env("EXPO_PUBLIC_DEFAULT_USER_ID")
+    or get_env("DEFAULT_USER_ID")
+    or "telegram:unknown"
+)
+
+# =====================================================================
 # Ilmu AI (Lazy Init Replacement for Gemini)
 # =====================================================================
-ILMU_API_KEY = get_env("ILMU_API_KEY")
+ILMU_API_KEY = get_env("ILMU_API_KEY") or get_env("API_KEY") or get_env("OPENAI_API_KEY")
 ILMU_BASE_URL = get_env("ILMU_BASE_URL", default="https://api.ilmu.ai/v1/chat/completions")
 ILMU_MODEL = get_env("ILMU_MODEL", default="ilmu-glm-5.1")
 
@@ -141,7 +150,7 @@ def call_ilmu_ai(system_prompt: str, user_content: str) -> Optional[str]:
         "temperature": 0.1  # Low temperature for strict JSON output
     }
     try:
-        response = requests.post(ILMU_BASE_URL, headers=headers, json=payload, timeout=30)
+        response = requests.post(ILMU_BASE_URL, headers=headers, json=payload, timeout=60)
         if response.status_code == 200:
             return response.json()['choices'][0]['message']['content'].strip()
         print(f"⚠️ Ilmu API Error {response.status_code}: {response.text}")
@@ -331,6 +340,99 @@ async def enqueue_automation_request(
         payload=payload,
         source=source,
     )
+
+
+# =====================================================================
+# Save a detected task as PENDING CONFIRMATION in Firestore
+# pendingTasks/{taskId}  — user must confirm before it goes to automationRequests
+# =====================================================================
+def _save_pending_task_sync(
+    *,
+    req_type: str,
+    payload: dict,
+    chat_id: int,
+    chat_title: str,
+    sender: str,
+    message_id: int,
+) -> Optional[str]:
+    db, firestore = _get_firestore()
+    if db is None or firestore is None:
+        return None
+
+    # Build a human-readable title for the activity card
+    if req_type == "create_calendar_event":
+        title = payload.get("summary") or "Meeting / Calendar Event"
+    elif req_type == "send_email":
+        title = f"Email: {payload.get('subject') or 'No subject'}"
+    else:
+        title = req_type.replace("_", " ").title()
+
+    doc = {
+        "type": req_type,
+        "payload": payload,
+        "status": "pending_confirmation",
+        "title": title,
+        "source": "telegram",
+        "chatId": chat_id,
+        "chatTitle": chat_title,
+        "sender": sender,
+        "messageId": message_id,
+        "createdAt": firestore.SERVER_TIMESTAMP,
+    }
+
+    _, ref = db.collection("pendingTasks").add(doc)
+    return ref.id
+
+
+async def save_pending_task(
+    *, req_type: str, payload: dict, chat_id: int,
+    chat_title: str, sender: str, message_id: int,
+) -> Optional[str]:
+    return await asyncio.to_thread(
+        _save_pending_task_sync,
+        req_type=req_type,
+        payload=payload,
+        chat_id=chat_id,
+        chat_title=chat_title,
+        sender=sender,
+        message_id=message_id,
+    )
+
+
+def _confirm_pending_task_sync(task_id: str) -> bool:
+    """Move a pending task to automationRequests (status=queued) and delete from pendingTasks.
+
+    Uses OWNER_USER_ID (from EXPO_PUBLIC_DEFAULT_USER_ID in .env) so the Cloud Function
+    can find the correct Google refresh token in Firestore.
+    """
+    db, firestore = _get_firestore()
+    if db is None or firestore is None:
+        return False
+
+    task_ref = db.collection("pendingTasks").document(task_id)
+    task = task_ref.get()
+    if not task.exists:
+        return False
+
+    data = task.to_dict()
+    automation_doc = {
+        "userId": OWNER_USER_ID,  # Must match the userId from the Google OAuth connect step
+        "type": data["type"],
+        "payload": data["payload"],
+        "status": "queued",
+        "createdAt": firestore.SERVER_TIMESTAMP,
+        "source": {
+            "telegram": {
+                "chatId": data.get("chatId"),
+                "chatTitle": data.get("chatTitle"),
+                "sender": data.get("sender"),
+                "messageId": data.get("messageId"),
+            }
+        },
+    }
+    db.collection("automationRequests").add(automation_doc)
+    task_ref.delete()
+    return True
 
 
 # =====================================================================
@@ -525,26 +627,19 @@ async def process_message(client, message):
         req_type = action.get("type")
         payload = action.get("payload", {})
         if req_type and payload:
-            user_id = f"telegram:{sender_id}"
-            source = {
-                "telegram": {
-                    "chatId": chat_id,
-                    "messageId": message.id,
-                    "sender": sender,
-                    "direction": direction,
-                }
-            }
-            request_id = await enqueue_automation_request(
-                user_id=user_id,
+            task_id = await save_pending_task(
                 req_type=req_type,
                 payload=payload,
-                source=source,
+                chat_id=chat_id,
+                chat_title=chat_title,
+                sender=sender,
+                message_id=message.id,
             )
-            if request_id:
-                print(f"🔥 Enqueued automationRequests/{request_id} ({req_type})")
-                print(f"🚀 [SUCCESS] Task '{req_type}' pushed to Firestore (ID: {request_id})")
+            if task_id:
+                print(f"📋 [PENDING] Task '{req_type}' saved for user confirmation (ID: {task_id})")
+                print(f"   Open the app → Crow AI tab to review and confirm it.")
             else:
-                print("⚠️ Failed to enqueue (Firebase not configured?)")
+                print("⚠️ Failed to save pending task (Firebase not configured?)")
 # =====================================================================
 # Entry point
 # =====================================================================

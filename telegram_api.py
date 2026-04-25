@@ -48,6 +48,16 @@ def _save_selected_chats(chat_ids: list) -> None:
         json.dump(chat_ids, f)
 
 from typing import Optional
+
+# ── User identity ─────────────────────────────────────────────────────────────
+# This is YOUR personal Telegram user ID (e.g. "telegram:1161905452").
+# The Google refresh token is stored under users/{OWNER_USER_ID}/integrations/google
+# in Firestore. It must match the userId you entered in the Explore tab.
+OWNER_USER_ID = (
+    get_env("EXPO_PUBLIC_DEFAULT_USER_ID")
+    or get_env("DEFAULT_USER_ID")
+    or "telegram:unknown"
+)
 from pyrogram.errors import SessionPasswordNeeded
 
 class SendCodeReq(BaseModel):
@@ -101,7 +111,7 @@ async def chat_endpoint(req: ChatMessageReq):
         "temperature": 0.7,
     }
     try:
-        response = requests.post(ILMU_BASE_URL, headers=headers, json=payload, timeout=30)
+        response = requests.post(ILMU_BASE_URL, headers=headers, json=payload, timeout=60)
         if response.status_code == 200:
             ai_reply = response.json()["choices"][0]["message"]["content"].strip()
             return {"response": ai_reply}
@@ -211,6 +221,120 @@ def set_selected_chats(req: SetSelectedChatsReq):
     """Persist the user's chosen chat IDs and return them."""
     _save_selected_chats(req.chatIds)
     return {"chatIds": req.chatIds, "saved": True}
+
+# =====================================================================
+# Pending Tasks — AI-detected tasks waiting for user confirmation
+# =====================================================================
+
+def _get_firestore_client():
+    """Lazy-load firebase_admin and return (db, firestore_module)."""
+    try:
+        import firebase_admin
+        from firebase_admin import credentials, firestore as fs
+    except ImportError:
+        return None, None
+
+    if not firebase_admin._apps:
+        sa_path = get_env("GOOGLE_APPLICATION_CREDENTIALS") or get_env("FIREBASE_SERVICE_ACCOUNT_KEY_PATH")
+        if sa_path:
+            import os as _os
+            _os.environ["GOOGLE_APPLICATION_CREDENTIALS"] = sa_path
+        try:
+            if sa_path and __import__("os").path.exists(sa_path):
+                firebase_admin.initialize_app(credentials.Certificate(sa_path))
+            else:
+                return None, None
+        except Exception:
+            return None, None
+
+    return fs.client(), fs
+
+@app.get("/pendingTasks")
+def get_pending_tasks():
+    """Return all pending AI-detected tasks waiting for user confirmation."""
+    db, fs_mod = _get_firestore_client()
+    if db is None:
+        return {"tasks": []}
+    try:
+        docs = (
+            db.collection("pendingTasks")
+            .where("status", "==", "pending_confirmation")
+            .stream()
+        )
+        tasks = []
+        for doc in docs:
+            d = doc.to_dict()
+            tasks.append({
+                "id": doc.id,
+                "type": d.get("type"),
+                "title": d.get("title", "Untitled Task"),
+                "payload": d.get("payload", {}),
+                "source": d.get("source", "telegram"),
+                "chatTitle": d.get("chatTitle", ""),
+                "sender": d.get("sender", ""),
+                "createdAt": d.get("createdAt").isoformat() if hasattr(d.get("createdAt"), "isoformat") else None,
+            })
+        return {"tasks": tasks}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+@app.post("/pendingTasks/{task_id}/confirm")
+def confirm_pending_task(task_id: str):
+    """Confirm a pending task — moves it to automationRequests for Google Calendar processing.
+
+    The userId stored in automationRequests MUST match the userId used when connecting
+    Google OAuth (Explore tab). It is read from EXPO_PUBLIC_DEFAULT_USER_ID in .env.
+    """
+    db, fs_mod = _get_firestore_client()
+    if db is None:
+        raise HTTPException(status_code=503, detail="Firebase not configured")
+    try:
+        task_ref = db.collection("pendingTasks").document(task_id)
+        task = task_ref.get()
+        if not task.exists:
+            raise HTTPException(status_code=404, detail="Task not found")
+
+        data = task.to_dict()
+
+        # Use the owner's real user ID (where the Google refresh token is stored),
+        # NOT the chat ID of the monitored group chat.
+        user_id = OWNER_USER_ID
+
+        automation_doc = {
+            "userId": user_id,
+            "type": data["type"],
+            "payload": data["payload"],
+            "status": "queued",
+            "createdAt": fs_mod.SERVER_TIMESTAMP,
+            "source": {
+                "telegram": {
+                    "chatId": data.get("chatId"),
+                    "chatTitle": data.get("chatTitle"),
+                    "sender": data.get("sender"),
+                    "messageId": data.get("messageId"),
+                }
+            },
+        }
+        _, ref = db.collection("automationRequests").add(automation_doc)
+        task_ref.delete()
+        print(f"✅ [CONFIRM] Task '{data.get('type')}' confirmed. automationRequest={ref.id}, userId={user_id}")
+        return {"confirmed": True, "automationRequestId": ref.id}
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+@app.delete("/pendingTasks/{task_id}")
+def dismiss_pending_task(task_id: str):
+    """Dismiss (delete) a pending task without acting on it."""
+    db, _ = _get_firestore_client()
+    if db is None:
+        raise HTTPException(status_code=503, detail="Firebase not configured")
+    try:
+        db.collection("pendingTasks").document(task_id).delete()
+        return {"dismissed": True}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
 
 # =====================================================================
 # Telegram Message Operations
@@ -338,7 +462,7 @@ async def process_message(req: ChatMessageReq):
             "temperature": 0.7,
         }
         
-        response = requests.post(ILMU_BASE_URL, headers=headers, json=payload, timeout=30)
+        response = requests.post(ILMU_BASE_URL, headers=headers, json=payload, timeout=60)
         if response.status_code == 200:
             ai_reply = response.json()["choices"][0]["message"]["content"].strip()
             return {"response": ai_reply}
