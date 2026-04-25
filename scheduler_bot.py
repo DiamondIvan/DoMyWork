@@ -3,18 +3,18 @@ import asyncio
 import json
 import hashlib
 from typing import Any, Optional
-
+import requests
 # Python 3.14 patch
 asyncio.set_event_loop(asyncio.new_event_loop())
-
+import base64
+from openai import OpenAI # Ensure this is at the top
 from pyrogram import Client, idle
 from pyrogram.handlers import MessageHandler
 
 from env_config import get_env, get_env_int
 
 # =====================================================================
-# Telegram credentials
-# =====================================================================
+# Telegram credentials# =====================================================================
 api_id = get_env_int("TELEGRAM_API_ID", fallback_names=["api_id"])
 api_hash = get_env("TELEGRAM_API_HASH", fallback_names=["api_hash"])
 session_name = get_env("PYROGRAM_SESSION_NAME", default="my_account")
@@ -32,10 +32,7 @@ else:
 # =====================================================================
 # Target chats — paste IDs from get_id.py here
 # =====================================================================
-GLOBAL_TARGET_IDS = [
-    -5131370378,  # Group
-    1088037939,   # DM
-]
+GLOBAL_TARGET_IDS = [-5100901072, -5121186491, -5126239079]
 
 # =====================================================================
 # Deduplication — skip images already processed this session
@@ -76,52 +73,68 @@ def extract_document_text(file_path: str) -> str:
 
 
 # =====================================================================
-# Gemini AI (lazy init)
+# Ilmu AI (Lazy Init Replacement for Gemini)
 # =====================================================================
-_GEMINI_MODEL: Any = None
+ILMU_API_KEY = "sk-b0ad8da654af17eb6c8cb5b1006be30c8ecb8c9e108dd875"
+ILMU_BASE_URL = "https://api.ilmu.ai/v1/chat/completions"
 
-
-def _get_gemini():
-    global _GEMINI_MODEL
-    if _GEMINI_MODEL is not None:
-        return _GEMINI_MODEL
+def call_ilmu_ai(system_prompt: str, user_content: str) -> Optional[str]:
+    """Helper to call Ilmu AI via HTTP requests."""
+    headers = {
+        "Authorization": f"Bearer {ILMU_API_KEY}",
+        "Content-Type": "application/json"
+    }
+    payload = {
+        "model": "ilmu-glm-5.1",
+        "messages": [
+            {"role": "system", "content": system_prompt},
+            {"role": "user", "content": user_content}
+        ],
+        "stream": False,
+        "temperature": 0.1  # Low temperature for strict JSON output
+    }
     try:
-        import google.generativeai as genai  # type: ignore
-    except ImportError:
-        print("⚠️ google-generativeai not installed. Run: pip install google-generativeai")
+        response = requests.post(ILMU_BASE_URL, headers=headers, json=payload, timeout=30)
+        if response.status_code == 200:
+            return response.json()['choices'][0]['message']['content'].strip()
+        print(f"⚠️ Ilmu API Error {response.status_code}: {response.text}")
         return None
-    key = get_env("GEMINI_API_KEY")
-    if not key:
-        print("⚠️ GEMINI_API_KEY not set in .env — AI pipeline disabled.")
-        return None
-    genai.configure(api_key=key)
-    _GEMINI_MODEL = genai.GenerativeModel("gemini-2.0-flash")
-    return _GEMINI_MODEL
-
-
-def describe_image_with_gemini(image_path: str) -> str:
-    """Ask Gemini to describe an image so we can store the description in Firestore."""
-    model = _get_gemini()
-    if model is None:
-        return "(image — AI disabled)"
-    try:
-        import PIL.Image  # type: ignore
-        with PIL.Image.open(image_path) as img:
-            response = model.generate_content(
-                ["Describe this image concisely in 1-2 sentences. Focus on any text, dates, events, or tasks visible.", img]
-            )
-        return response.text.strip()
     except Exception as e:
-        print(f"⚠️ Image description error: {e}")
-        return "(image — description failed)"
+        print(f"❌ Ilmu Request Failed: {e}")
+        return None
 
+# =====================================================================
+# GPT-4o-mini Integration (Replacement for Ilmu/Gemini)
+# =====================================================================
+OPENAI_API_KEY = get_env("OPENAI_API_KEY")
+gpt_client = OpenAI(api_key=OPENAI_API_KEY)
 
+def describe_image_with_gpt(image_path: str) -> str:
+    """Uses GPT-4o-mini to actually see and describe the image."""
+    try:
+        with open(image_path, "rb") as image_file:
+            base64_image = base64.b64encode(image_file.read()).decode('utf-8')
+
+        response = gpt_client.chat.completions.create(
+            model="gpt-4o-mini",
+            messages=[{
+                "role": "user",
+                "content": [
+                    {"type": "text", "text": "What is in this image? Focus on dates, times, and tasks for a calendar."},
+                    {"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{base64_image}"}}
+                ],
+            }],
+            max_tokens=300
+        )
+        return response.choices[0].message.content
+    except Exception as e:
+        print(f"❌ [GPT VISION ERROR]: {e}")
+        return "(Image received - failed to describe)"
 # =====================================================================
 # Firestore (lazy init)
 # =====================================================================
 _FIRESTORE_CLIENT: Any = None
 _FIRESTORE_MODULE: Any = None
-
 
 def _get_firestore():
     global _FIRESTORE_CLIENT, _FIRESTORE_MODULE
@@ -264,82 +277,55 @@ async def enqueue_automation_request(
 
 
 # =====================================================================
-# AI Pipeline — Gemini reads full chat history and detects actions
+# AI Pipeline — Ilmu reads chat history and detects actions
 # =====================================================================
-_AI_PROMPT = """\
-You are a strict scheduling assistant monitoring a Telegram conversation called "{chat_title}".
-
-Read the entire conversation below and decide if there is a MANDATORY actionable task to automate.
-
-DEFINITIONS:
-- MANDATORY: Project meetings, assignment deadlines, emails to send, calendar events to create. (Act on these)
-- PROMO_SPAM: Public festivals, club recruitment blasts, general advertisements, optional events. (Ignore these)
-
-Actionable tasks you can create:
-- Sending an email (e.g. "email John at john@example.com", "send a summary to someone")
-- Creating a calendar event (e.g. "meeting tomorrow 3pm", "schedule a call on Friday", "remind me at 5pm")
-
-If you detect a MANDATORY actionable task, respond with ONLY a valid JSON object:
-
-Send email:
-{{"type": "send_email", "payload": {{"to": "email@example.com", "subject": "...", "bodyText": "..."}}}}
-
-Create calendar event:
-{{"type": "create_calendar_event", "payload": {{"summary": "...", "description": "...", "start": "2026-04-24T15:00:00+08:00", "end": "2026-04-24T16:00:00+08:00", "attendees": []}}}}
-
-If there is NO new MANDATORY actionable task (or it is PROMO_SPAM), respond with ONLY: null
-
-Rules:
-- Reply with ONLY valid JSON or the word null — no markdown, no explanation.
-- Use timezone offset +08:00 for all datetimes.
-- Focus on the most recent unactioned task. Do NOT repeat actions for messages already discussed.
-- If required details (email address, time) are genuinely unknown, return null.
-
-Conversation:
-{history}
-"""
-
-
 async def run_ai_pipeline(chat_id: int, chat_title: str) -> Optional[dict]:
-    model = _get_gemini()
-    if model is None:
-        return None
-
+    # Fetch history from Firestore
     messages = await get_all_messages(chat_id)
     if not messages:
         return None
+    print(f"🧠 [AI CONTEXT] Analyzing last {len(messages)} messages for actionable tasks...")
 
+    # Format history for the AI context
     history = "\n".join(
         f"[{m.get('direction', '?').upper()}] {m.get('sender', 'Unknown')}: "
         f"{m.get('text') or '(media)'}"
         for m in messages
     )
+    system_prompt = (
+        f"You are a strict scheduling assistant for the Telegram chat '{chat_title}'. "
+        "Extract MANDATORY tasks: project meetings, deadlines, or emails. Ignore spam/ads. "
+        "You MUST respond ONLY with a valid JSON object or the word 'null'."
+    )
 
-    prompt = _AI_PROMPT.format(chat_title=chat_title, history=history)
+    user_content = f"""
+    Based on the following history, detect if a new mandatory task is needed:
+    {history}
+
+    Output format:
+    - Email: {{"type": "send_email", "payload": {{"to": "...", "subject": "...", "bodyText": "..."}}}}
+    - Calendar: {{"type": "create_calendar_event", "payload": {{"summary": "...", "description": "...", "start": "2026-04-24T15:00:00+08:00", "end": "2026-04-24T16:00:00+08:00"}}}}
+   
+    If no action, return: null
+    """
+
+    # Run the request in a thread to keep the bot responsive
+    raw = await asyncio.to_thread(call_ilmu_ai, system_prompt, user_content)
+    if not raw or raw.lower() == "null":
+        print("💤 [AI RESULT] No mandatory tasks detected.")
+        return None
+    else:
+        print(f"🎯 [AI RESULT] Task Found: {raw}")
 
     try:
-        response = await asyncio.to_thread(model.generate_content, prompt)
-        raw = response.text.strip()
-        print(f"🤖 Gemini: {raw}")
-
-        if not raw or raw.lower() == "null":
-            return None
-
-        # Strip markdown code fences if the model adds them
-        if raw.startswith("```"):
-            lines = raw.splitlines()
-            raw = "\n".join(lines[1:-1]).strip()
-
+        # Strip potential markdown fences Ilmu might add
+        if "```" in raw:
+            raw = raw.split("```")[1].replace("json", "").strip()
         return json.loads(raw)
-
-    except json.JSONDecodeError:
-        print(f"⚠️ Gemini returned invalid JSON: {raw}")
-        return None
     except Exception as e:
-        print(f"⚠️ Gemini error: {e}")
+        print(f"⚠️ AI JSON Error: {e} | Raw Output: {raw}")
         return None
-
-
+   
 # =====================================================================
 # Core message handler
 # =====================================================================
@@ -410,7 +396,7 @@ async def process_message(client, message):
     if downloaded_file_path:
         if is_image:
             print("🧠 Describing image with Gemini...")
-            description = await asyncio.to_thread(describe_image_with_gemini, downloaded_file_path)
+            description = await asyncio.to_thread(describe_image_with_gpt, downloaded_file_path)
             enriched_text = f"{content}\n[Image description: {description}]".strip()
             print(f"🖼️ Image described: {description}")
         else:
@@ -439,14 +425,12 @@ async def process_message(client, message):
         telegram_message_id=message.id,
     )
     print("💾 Message saved to Firestore.")
-
     # 2. Run AI on full chat history
     action = await run_ai_pipeline(chat_id, chat_title)
 
     if action is not None:
         req_type = action.get("type")
         payload = action.get("payload", {})
-
         if req_type and payload:
             user_id = f"telegram:{sender_id}"
             source = {
@@ -457,20 +441,17 @@ async def process_message(client, message):
                     "direction": direction,
                 }
             }
-
             request_id = await enqueue_automation_request(
                 user_id=user_id,
                 req_type=req_type,
                 payload=payload,
                 source=source,
             )
-
             if request_id:
                 print(f"🔥 Enqueued automationRequests/{request_id} ({req_type})")
+                print(f"🚀 [SUCCESS] Task '{req_type}' pushed to Firestore (ID: {request_id})")
             else:
                 print("⚠️ Failed to enqueue (Firebase not configured?)")
-
-
 # =====================================================================
 # Entry point
 # =====================================================================
@@ -478,14 +459,10 @@ async def main():
     if not GLOBAL_TARGET_IDS:
         print("⚠️ GLOBAL_TARGET_IDS is empty. Run get_id.py and add IDs first!")
         return
-
     app.add_handler(MessageHandler(process_message))
     print(f"\n🤖 DoMyWork is listening to {len(GLOBAL_TARGET_IDS)} chat(s)... (Ctrl+C to stop)")
-
     await app.start()
     await idle()
     await app.stop()
-
-
 if __name__ == "__main__":
     app.run(main())
