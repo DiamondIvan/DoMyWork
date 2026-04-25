@@ -8,15 +8,15 @@ Check out our project in action!
 
 
 ## ✨ Features
-* **Feature 1:** Describe a core piece of functionality.
-* **Feature 2:** Describe another core piece of functionality (e.g., AI integration, scheduling).
-* **Feature 3:** Describe what makes the user experience great.
+* **Feature 1:** Detects specific event types based on user preferences, while ignoring social noise and spam.
+* **Feature 2:** Optimized smart scheduler to prevent scheduling conflicts.
+* **Feature 3:** Direct export schedule to Google Calendar and Gmail.  
 
 ## 🛠️ Tech Stack
 * **Framework:** [Expo](https://expo.dev/) & React Native
 * **Routing:** Expo File-Based Routing
-* **Backend/API:** [List your backend, e.g., Firebase, Node.js, etc.]
-* **AI Integration:** [List APIs, e.g., Gemini, Ilmu AI]
+* **Backend/API:** Firebase, Node.js
+* **AI Integration:** Gemini API, Z.AI API, Telegram API
 
 ---
 
