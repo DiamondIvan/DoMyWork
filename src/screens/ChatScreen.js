@@ -75,6 +75,9 @@ const ChatScreen = () => {
     if ((!userMessage.trim() && !selectedImage) || isSending) return;
 
     try {
+      if (!backendUrl) {
+        throw new Error("Missing chat backend URL (EXPO_PUBLIC_CHAT_API_URL).");
+      }
       setIsSending(true);
       const formData = new FormData();
       formData.append("message", userMessage);
@@ -117,7 +120,11 @@ const ChatScreen = () => {
       setUserMessage("");
       setSelectedImage(null);
     } catch (error) {
-      Alert.alert("Error", "Failed to send message");
+      Alert.alert(
+        "Send failed",
+        error?.message ??
+          "Could not reach the backend. Check EXPO_PUBLIC_CHAT_API_URL and that the server is running.",
+      );
     } finally {
       setIsSending(false);
     }
@@ -300,7 +307,7 @@ const styles = StyleSheet.create({
     padding: 20,
   },
   chatContent: {
-    paddingBottom: 120,
+    paddingBottom: 190,
   },
   botBubble: {
     backgroundColor: COLORS.secondary,
@@ -390,7 +397,7 @@ const styles = StyleSheet.create({
   },
   inputSection: {
     paddingHorizontal: 20,
-    paddingBottom: 20,
+    paddingBottom: 28,
     borderTopWidth: 1,
     borderTopColor: "#e9edf2",
     backgroundColor: "#fff",
@@ -399,7 +406,7 @@ const styles = StyleSheet.create({
     color: COLORS.darkGray,
     fontWeight: "700",
     fontSize: 13,
-    marginBottom: 10,
+    marginBottom: 6,
   },
   imagePreview: {
     position: "relative",

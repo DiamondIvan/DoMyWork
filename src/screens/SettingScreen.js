@@ -5,9 +5,11 @@ import {
   Alert,
   Image,
   Linking,
+  Modal,
   Pressable,
   ScrollView,
   StyleSheet,
+  Switch,
   Text,
   TextInput,
   TouchableOpacity,
@@ -15,6 +17,8 @@ import {
 } from "react-native";
 import { defaultUserId } from "../constants/backend";
 import { COLORS } from "../constants/theme";
+import { ensureNotificationPermission } from "../services/notifications";
+import { useActivityStore } from "../store/ActivityProvider";
 
 WebBrowser.maybeCompleteAuthSession();
 
@@ -27,6 +31,9 @@ export default function SettingScreen() {
   const [userId, setUserId] = useState(defaultUserId);
   const [statusText, setStatusText] = useState("");
   const [isConnecting, setIsConnecting] = useState(false);
+  const [aboutOpen, setAboutOpen] = useState(false);
+  const [notificationStatusText, setNotificationStatusText] = useState("");
+  const { state, actions } = useActivityStore();
   const googleClientId = process.env.EXPO_PUBLIC_GOOGLE_OAUTH_CLIENT_ID ?? "";
   const functionsBaseUrl = (
     process.env.EXPO_PUBLIC_FUNCTIONS_BASE_URL ?? ""
@@ -194,6 +201,29 @@ export default function SettingScreen() {
     }
   };
 
+  const setNotificationsEnabled = async (nextEnabled) => {
+    setNotificationStatusText("");
+    if (!nextEnabled) {
+      actions.setNotificationsEnabled(false);
+      setNotificationStatusText("Notifications disabled.");
+      return;
+    }
+
+    try {
+      const res = await ensureNotificationPermission();
+      if (!res.granted) {
+        actions.setNotificationsEnabled(false);
+        setNotificationStatusText("Permission not granted. Enable in device settings.");
+        return;
+      }
+      actions.setNotificationsEnabled(true);
+      setNotificationStatusText("Notifications enabled.");
+    } catch (e) {
+      actions.setNotificationsEnabled(false);
+      setNotificationStatusText(e?.message ?? "Failed to enable notifications.");
+    }
+  };
+
   return (
     <View style={styles.container}>
       <View style={styles.header}>
@@ -287,14 +317,34 @@ export default function SettingScreen() {
           </View>
         </View>
 
+        <Text style={styles.sectionTitle}>Notifications</Text>
+        <View style={styles.card}>
+          <View style={styles.personalizationRow}>
+            <Text style={styles.label}>Enable reminders</Text>
+            <Switch
+              value={!!state.settings.notificationsEnabled}
+              onValueChange={setNotificationsEnabled}
+              trackColor={{ false: "#cbd5e1", true: COLORS.primary }}
+              thumbColor="#fff"
+            />
+          </View>
+          {!!notificationStatusText && (
+            <Text style={styles.statusSubText}>{notificationStatusText}</Text>
+          )}
+        </View>
+
         <Text style={styles.sectionTitle}>General & Support</Text>
         <View style={styles.card}>
-          {["Help Center", "Report", "About Crow AI"].map((item) => (
+          {["Help Center", "Report"].map((item) => (
             <TouchableOpacity key={item} style={styles.row}>
               <Text style={styles.supportText}>{item}</Text>
               <Text style={styles.arrow}>›</Text>
             </TouchableOpacity>
           ))}
+          <TouchableOpacity style={styles.row} onPress={() => setAboutOpen(true)}>
+            <Text style={styles.supportText}>About Crow AI</Text>
+            <Text style={styles.arrow}>›</Text>
+          </TouchableOpacity>
         </View>
 
         <Text style={styles.poweredBy}>Powered by Last Minute AI</Text>
@@ -303,6 +353,29 @@ export default function SettingScreen() {
           <Text style={styles.logoutText}>Log out</Text>
         </TouchableOpacity>
       </ScrollView>
+
+      <Modal
+        visible={aboutOpen}
+        transparent
+        animationType="fade"
+        onRequestClose={() => setAboutOpen(false)}
+      >
+        <View style={styles.modalBackdrop}>
+          <View style={styles.modalCard}>
+            <Text style={styles.modalTitle}>About Crow AI</Text>
+            <Text style={styles.modalBody}>
+              Crow AI helps you turn messages into activities, manage your to-do and due items,
+              and keep a clean history of what you’ve finished.
+            </Text>
+            <TouchableOpacity
+              style={styles.modalCloseBtn}
+              onPress={() => setAboutOpen(false)}
+            >
+              <Text style={styles.modalCloseText}>Close</Text>
+            </TouchableOpacity>
+          </View>
+        </View>
+      </Modal>
     </View>
   );
 }
@@ -345,7 +418,7 @@ const styles = StyleSheet.create({
   },
   content: {
     padding: 20,
-    paddingBottom: 130,
+    paddingBottom: 190,
   },
   pageTitle: {
     fontSize: 18,
@@ -481,6 +554,42 @@ const styles = StyleSheet.create({
     marginTop: 6,
     color: COLORS.textGray,
     fontSize: 11,
+  },
+  modalBackdrop: {
+    flex: 1,
+    backgroundColor: "rgba(0,0,0,0.45)",
+    justifyContent: "center",
+    padding: 18,
+  },
+  modalCard: {
+    backgroundColor: "#fff",
+    borderRadius: 16,
+    padding: 16,
+    borderWidth: 1,
+    borderColor: "#e5e7eb",
+  },
+  modalTitle: {
+    fontSize: 16,
+    fontWeight: "900",
+    color: COLORS.darkGray,
+  },
+  modalBody: {
+    marginTop: 10,
+    fontSize: 13,
+    color: COLORS.textGray,
+    fontWeight: "600",
+    lineHeight: 18,
+  },
+  modalCloseBtn: {
+    marginTop: 14,
+    backgroundColor: COLORS.primary,
+    borderRadius: 12,
+    paddingVertical: 10,
+    alignItems: "center",
+  },
+  modalCloseText: {
+    color: "#fff",
+    fontWeight: "900",
   },
   personalizationRow: {
     flexDirection: "row",

@@ -1,30 +1,54 @@
-import { useEffect, useState } from "react";
+import { useEffect, useMemo, useState } from "react";
 import {
+  Modal,
   ScrollView,
   StyleSheet,
   Text,
+  TextInput,
   TouchableOpacity,
   View,
 } from "react-native";
+import WeekCalendar from "../components/WeekCalendar";
+import { useActivityStore } from "../store/ActivityProvider";
 import { COLORS } from "../constants/theme";
+import { cancelScheduledNotification, scheduleActivityReminder } from "../services/notifications";
+
+function todayISO(d = new Date()) {
+  const yr = d.getFullYear();
+  const mo = String(d.getMonth() + 1).padStart(2, "0");
+  const da = String(d.getDate()).padStart(2, "0");
+  return `${yr}-${mo}-${da}`;
+}
+
+function prettyISO(iso) {
+  const [y, m, d] = iso.split("-").map((x) => Number(x));
+  const dt = new Date(y, (m ?? 1) - 1, d ?? 1);
+  const months = [
+    "January",
+    "February",
+    "March",
+    "April",
+    "May",
+    "June",
+    "July",
+    "August",
+    "September",
+    "October",
+    "November",
+    "December",
+  ];
+  return `${months[dt.getMonth()]} ${dt.getDate()}, ${dt.getFullYear()}`;
+}
 
 const ToDoScreen = () => {
   const [currentTime, setCurrentTime] = useState(new Date());
-  const [tasks, setTasks] = useState([
-    {
-      id: 1,
-      time: "9:00AM - 10:00AM",
-      title: "Assignment Meeting",
-      completed: false,
-    },
-    {
-      id: 2,
-      time: "5:00PM - 9:00PM",
-      title: "Part-Time Job",
-      completed: false,
-    },
-  ]);
-  const [isDueCompleted, setIsDueCompleted] = useState(false);
+  const { state, actions } = useActivityStore();
+  const [selectedDateISO, setSelectedDateISO] = useState(todayISO());
+  const [addOpen, setAddOpen] = useState(false);
+  const [newTitle, setNewTitle] = useState("");
+  const [newTimeLabel, setNewTimeLabel] = useState("");
+  const [newKind, setNewKind] = useState("activity");
+  const [newReminder, setNewReminder] = useState("none");
 
   useEffect(() => {
     const timer = setInterval(() => setCurrentTime(new Date()), 1000);
@@ -55,12 +79,60 @@ const ToDoScreen = () => {
     return `${hours}:${minutes}`;
   };
 
-  const toggleTaskComplete = (taskId) => {
-    setTasks((prev) =>
-      prev.map((task) =>
-        task.id === taskId ? { ...task, completed: !task.completed } : task,
-      ),
+  const itemsForDay = useMemo(() => {
+    return state.items.filter(
+      (it) => it.status === "todo" && it.dateISO === selectedDateISO,
     );
+  }, [state.items, selectedDateISO]);
+
+  const activities = useMemo(
+    () => itemsForDay.filter((it) => it.kind === "activity"),
+    [itemsForDay],
+  );
+  const dues = useMemo(
+    () => itemsForDay.filter((it) => it.kind === "due"),
+    [itemsForDay],
+  );
+
+  const closeAndResetModal = () => {
+    setAddOpen(false);
+    setNewTitle("");
+    setNewTimeLabel("");
+    setNewKind("activity");
+    setNewReminder("none");
+  };
+
+  const submitNew = () => {
+    const title = newTitle.trim();
+    if (!title) return;
+
+    const item = actions.addItem({
+      title,
+      source: "manual",
+      dateISO: selectedDateISO,
+      timeLabel: newTimeLabel.trim(),
+      status: "todo",
+      kind: newKind === "due" ? "due" : "activity",
+      reminder: newReminder,
+    });
+
+    // Best-effort scheduling (only when enabled + reminder chosen)
+    if (state.settings.notificationsEnabled && item.reminder !== "none") {
+      scheduleActivityReminder(item)
+        .then((notificationId) => {
+          if (notificationId) actions.updateItem(item.id, { notificationId });
+        })
+        .catch(() => {});
+    }
+
+    closeAndResetModal();
+  };
+
+  const finishItem = async (task) => {
+    if (task.notificationId) {
+      await cancelScheduledNotification(task.notificationId);
+    }
+    actions.markCompleted(task.id);
   };
 
   return (
@@ -77,60 +149,130 @@ const ToDoScreen = () => {
         contentContainerStyle={styles.content}
         showsVerticalScrollIndicator={false}
       >
-        <Text style={styles.sectionTitle}>To-Do List</Text>
+        <WeekCalendar
+          selectedDateISO={selectedDateISO}
+          onSelectDateISO={setSelectedDateISO}
+        />
 
         <View style={styles.dateFilter}>
-          <Text style={styles.filterText}>{formatDate(currentTime)}</Text>
+          <Text style={styles.filterText}>{prettyISO(selectedDateISO)}</Text>
         </View>
 
-        {tasks.map((task) => (
+        <View style={styles.sectionRow}>
+          <Text style={styles.sectionTitle}>To-Do List</Text>
+          <TouchableOpacity style={styles.addBtnSmall} onPress={() => setAddOpen(true)}>
+            <Text style={styles.addBtnSmallText}>+ Add</Text>
+          </TouchableOpacity>
+        </View>
+
+        {activities.length === 0 && (
+          <Text style={styles.emptyText}>No activities for this day.</Text>
+        )}
+        {activities.map((task) => (
           <View key={task.id} style={styles.taskCard}>
-            <Text style={styles.taskTime}>{task.time}</Text>
+            {!!task.timeLabel && <Text style={styles.taskTime}>{task.timeLabel}</Text>}
             <View style={styles.taskTitleBox}>
-              <Text
-                style={[
-                  styles.taskTitle,
-                  task.completed && styles.taskTitleDone,
-                ]}
-              >
-                {task.title}
-              </Text>
+              <Text style={styles.taskTitle}>{task.title}</Text>
             </View>
             <TouchableOpacity
-              style={[styles.finishBtn, task.completed && styles.finishBtnDone]}
-              onPress={() => toggleTaskComplete(task.id)}
+              style={styles.finishBtn}
+              onPress={() => finishItem(task)}
             >
-              <Text
-                style={[
-                  styles.finishBtnText,
-                  task.completed && styles.finishBtnTextDone,
-                ]}
-              >
-                {task.completed ? "Completed" : "Finish Progress"}
-              </Text>
+              <Text style={styles.finishBtnText}>Finish</Text>
             </TouchableOpacity>
           </View>
         ))}
 
-        <Text style={styles.sectionTitle}>Due Date</Text>
-        <View style={styles.dueCard}>
-          <Text style={styles.dueDate}>Apr 30, 2025 11:59PM</Text>
-          <Text style={styles.dueTitle}>DS Assignment</Text>
-          <TouchableOpacity
-            style={[styles.finishBtn, isDueCompleted && styles.finishBtnDone]}
-            onPress={() => setIsDueCompleted((prev) => !prev)}
-          >
-            <Text
-              style={[
-                styles.finishBtnText,
-                isDueCompleted && styles.finishBtnTextDone,
-              ]}
+        <Text style={styles.sectionTitle}>Due</Text>
+        {dues.length === 0 && <Text style={styles.emptyText}>No due items.</Text>}
+        {dues.map((task) => (
+          <View key={task.id} style={styles.dueCard}>
+            <Text style={styles.dueDate}>{task.timeLabel || prettyISO(task.dateISO)}</Text>
+            <Text style={styles.dueTitle}>{task.title}</Text>
+            <TouchableOpacity
+              style={styles.finishBtn}
+              onPress={() => finishItem(task)}
             >
-              {isDueCompleted ? "Completed" : "Finish Progress"}
-            </Text>
-          </TouchableOpacity>
-        </View>
+              <Text style={styles.finishBtnText}>Finish</Text>
+            </TouchableOpacity>
+          </View>
+        ))}
       </ScrollView>
+
+      <Modal visible={addOpen} transparent animationType="fade" onRequestClose={closeAndResetModal}>
+        <View style={styles.modalBackdrop}>
+          <View style={styles.modalCard}>
+            <Text style={styles.modalTitle}>Add {newKind === "due" ? "Due" : "Activity"}</Text>
+            <Text style={styles.modalSub}>{prettyISO(selectedDateISO)}</Text>
+
+            <TextInput
+              value={newTitle}
+              onChangeText={setNewTitle}
+              placeholder="Title"
+              placeholderTextColor="#94a3b8"
+              style={styles.modalInput}
+            />
+            <TextInput
+              value={newTimeLabel}
+              onChangeText={setNewTimeLabel}
+              placeholder={newKind === "due" ? "Due time (optional)" : "Time (optional)"}
+              placeholderTextColor="#94a3b8"
+              style={styles.modalInput}
+            />
+
+            <View style={styles.pillRow}>
+              {[
+                { id: "activity", label: "Activity" },
+                { id: "due", label: "Due" },
+              ].map((k) => {
+                const active = newKind === k.id;
+                return (
+                  <TouchableOpacity
+                    key={k.id}
+                    onPress={() => setNewKind(k.id)}
+                    style={[styles.pill, active && styles.pillActive]}
+                  >
+                    <Text style={[styles.pillText, active && styles.pillTextActive]}>
+                      {k.label}
+                    </Text>
+                  </TouchableOpacity>
+                );
+              })}
+            </View>
+
+            <View style={styles.pillRow}>
+              {[
+                { id: "none", label: "No reminder" },
+                { id: "1h", label: "1h" },
+                { id: "1day", label: "1d" },
+                { id: "1week", label: "1w" },
+              ].map((r) => {
+                const active = newReminder === r.id;
+                return (
+                  <TouchableOpacity
+                    key={r.id}
+                    onPress={() => setNewReminder(r.id)}
+                    style={[styles.pill, active && styles.pillActive]}
+                  >
+                    <Text style={[styles.pillText, active && styles.pillTextActive]}>
+                      {r.label}
+                    </Text>
+                  </TouchableOpacity>
+                );
+              })}
+            </View>
+
+            <View style={styles.modalBtnRow}>
+              <TouchableOpacity style={styles.modalCancel} onPress={closeAndResetModal}>
+                <Text style={styles.modalCancelText}>Cancel</Text>
+              </TouchableOpacity>
+              <TouchableOpacity style={styles.modalSave} onPress={submitNew}>
+                <Text style={styles.modalSaveText}>Save</Text>
+              </TouchableOpacity>
+            </View>
+          </View>
+        </View>
+      </Modal>
     </View>
   );
 };
@@ -173,13 +315,31 @@ const styles = StyleSheet.create({
   },
   content: {
     padding: 20,
-    paddingBottom: 130,
+    paddingBottom: 190,
+  },
+  sectionRow: {
+    flexDirection: "row",
+    alignItems: "center",
+    justifyContent: "space-between",
+    marginVertical: 15,
   },
   sectionTitle: {
     fontSize: 18,
     fontWeight: "bold",
-    marginVertical: 15,
     color: COLORS.darkGray,
+  },
+  addBtnSmall: {
+    borderWidth: 1.5,
+    borderColor: COLORS.primary,
+    paddingHorizontal: 12,
+    paddingVertical: 6,
+    borderRadius: 16,
+    backgroundColor: "#f0fbfb",
+  },
+  addBtnSmallText: {
+    color: COLORS.primary,
+    fontWeight: "800",
+    fontSize: 12,
   },
   dateFilter: {
     borderWidth: 1.5,
@@ -217,27 +377,17 @@ const styles = StyleSheet.create({
     color: COLORS.darkGray,
     fontWeight: "500",
   },
-  taskTitleDone: {
-    textDecorationLine: "line-through",
-    color: COLORS.textGray,
-  },
   finishBtn: {
     alignSelf: "flex-start",
-    backgroundColor: "#eee",
-    paddingVertical: 6,
+    backgroundColor: COLORS.primary,
+    paddingVertical: 7,
     paddingHorizontal: 14,
     borderRadius: 15,
   },
-  finishBtnDone: {
-    backgroundColor: "#d9f6de",
-  },
   finishBtnText: {
     fontSize: 11,
-    color: COLORS.textGray,
-    fontWeight: "600",
-  },
-  finishBtnTextDone: {
-    color: "#0e7d2f",
+    color: "#fff",
+    fontWeight: "800",
   },
   dueCard: {
     borderWidth: 1.5,
@@ -257,6 +407,104 @@ const styles = StyleSheet.create({
     fontWeight: "600",
     color: COLORS.darkGray,
     marginBottom: 10,
+  },
+  emptyText: {
+    fontSize: 12,
+    color: COLORS.textGray,
+    marginBottom: 12,
+    fontStyle: "italic",
+  },
+  modalBackdrop: {
+    flex: 1,
+    backgroundColor: "rgba(0,0,0,0.45)",
+    justifyContent: "center",
+    padding: 18,
+  },
+  modalCard: {
+    backgroundColor: "#fff",
+    borderRadius: 16,
+    padding: 16,
+    borderWidth: 1,
+    borderColor: "#e5e7eb",
+  },
+  modalTitle: {
+    fontSize: 16,
+    fontWeight: "900",
+    color: COLORS.darkGray,
+  },
+  modalSub: {
+    marginTop: 4,
+    fontSize: 12,
+    color: COLORS.textGray,
+    fontWeight: "600",
+    marginBottom: 12,
+  },
+  modalInput: {
+    borderWidth: 1,
+    borderColor: "#d9e1ea",
+    borderRadius: 12,
+    paddingHorizontal: 12,
+    paddingVertical: 10,
+    color: COLORS.darkGray,
+    marginBottom: 10,
+    backgroundColor: "#f8fafc",
+  },
+  pillRow: {
+    flexDirection: "row",
+    flexWrap: "wrap",
+    gap: 8,
+    marginBottom: 10,
+  },
+  pill: {
+    borderWidth: 1.5,
+    borderColor: "#d9e1ea",
+    backgroundColor: "#fff",
+    borderRadius: 999,
+    paddingVertical: 7,
+    paddingHorizontal: 10,
+  },
+  pillActive: {
+    borderColor: COLORS.primary,
+    backgroundColor: "#f0fbfb",
+  },
+  pillText: {
+    color: COLORS.textGray,
+    fontWeight: "800",
+    fontSize: 11,
+  },
+  pillTextActive: {
+    color: COLORS.primary,
+  },
+  modalBtnRow: {
+    flexDirection: "row",
+    justifyContent: "space-between",
+    marginTop: 6,
+  },
+  modalCancel: {
+    flex: 1,
+    marginRight: 8,
+    borderWidth: 1.5,
+    borderColor: "#d1d5db",
+    borderRadius: 12,
+    paddingVertical: 10,
+    alignItems: "center",
+    backgroundColor: "#fff",
+  },
+  modalCancelText: {
+    fontWeight: "900",
+    color: COLORS.textGray,
+  },
+  modalSave: {
+    flex: 1,
+    marginLeft: 8,
+    borderRadius: 12,
+    paddingVertical: 10,
+    alignItems: "center",
+    backgroundColor: COLORS.primary,
+  },
+  modalSaveText: {
+    fontWeight: "900",
+    color: "#fff",
   },
 });
 

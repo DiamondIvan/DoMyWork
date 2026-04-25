@@ -12,11 +12,13 @@ import {
 } from "react-native";
 import { defaultUserId, enqueueAutomationRequest } from "../constants/backend";
 import { COLORS } from "../constants/theme";
+import { useActivityStore } from "../store/ActivityProvider";
 
 const MenuScreen = () => {
   const [currentTime, setCurrentTime] = useState(new Date());
   const [searchQuery, setSearchQuery] = useState("");
   const [selectedFilters, setSelectedFilters] = useState([]);
+  const { state, actions } = useActivityStore();
   const [messages] = useState([
     {
       id: 1,
@@ -38,10 +40,6 @@ const MenuScreen = () => {
       time: "11:15",
     },
   ]);
-  const [manualTitle, setManualTitle] = useState("");
-  const [manualDate, setManualDate] = useState("");
-  const [manualTime, setManualTime] = useState("");
-  const [manualActivities, setManualActivities] = useState([]);
   const [backendStatus, setBackendStatus] = useState("");
 
   const filterOptions = [
@@ -104,30 +102,12 @@ const MenuScreen = () => {
     );
   };
 
-  const addManualActivity = () => {
-    const title = manualTitle.trim();
-    const date = manualDate.trim();
-    const time = manualTime.trim();
-
-    if (!title || !date || !time) {
-      Alert.alert("Missing details", "Please fill title, date, and time.");
-      return;
-    }
-
-    setManualActivities((prev) => [
-      {
-        id: Date.now().toString(),
-        title,
-        date,
-        time,
-      },
-      ...prev,
-    ]);
-
-    setManualTitle("");
-    setManualDate("");
-    setManualTime("");
-  };
+  const pendingItems = useMemo(() => {
+    return state.items
+      .filter((it) => it.status === "pending")
+      .slice()
+      .sort((a, b) => (b.createdAtISO || "").localeCompare(a.createdAtISO || ""));
+  }, [state.items]);
 
   const openGoogleCalendar = async () => {
     const url = "https://calendar.google.com";
@@ -142,7 +122,32 @@ const MenuScreen = () => {
     await Linking.openURL(url);
   };
 
-  const weeklyStats = [3, 5, 2, 6, 4, 7, 5];
+  const weeklyStats = useMemo(() => {
+    const now = new Date();
+    const days = Array.from({ length: 7 }).map((_, i) => {
+      const d = new Date(now);
+      d.setDate(now.getDate() - (6 - i));
+      const yr = d.getFullYear();
+      const mo = String(d.getMonth() + 1).padStart(2, "0");
+      const da = String(d.getDate()).padStart(2, "0");
+      return `${yr}-${mo}-${da}`;
+    });
+
+    const completed = state.items.filter((it) => it.status === "completed");
+    const counts = days.map((iso) => completed.filter((it) => it.dateISO === iso).length);
+    return counts;
+  }, [state.items]);
+
+  const sourceCounts = useMemo(() => {
+    const completed = state.items.filter((it) => it.status === "completed");
+    const base = { telegram: 0, email: 0, spectrum: 0 };
+    for (const it of completed) {
+      if (it.source === "telegram") base.telegram += 1;
+      if (it.source === "email") base.email += 1;
+      if (it.source === "spectrum") base.spectrum += 1;
+    }
+    return base;
+  }, [state.items]);
 
   const queueSendEmailMission = async () => {
     try {
@@ -265,59 +270,31 @@ const MenuScreen = () => {
         </View>
 
         <Text style={styles.sectionTitle}>Pending Confirmation</Text>
-        <View style={styles.card}>
-          <Text style={styles.cardTime}>06/05/2026 8:00-10:00am</Text>
-          <Text style={styles.cardTask}>DS Midterm</Text>
-          <View style={styles.btnRow}>
-            <TouchableOpacity style={styles.btnConfirm}>
-              <Text style={styles.btnConfirmText}>✓ Confirm</Text>
-            </TouchableOpacity>
-            <TouchableOpacity style={styles.btnCancel}>
-              <Text style={styles.btnCancelText}>✕ Cancel</Text>
-            </TouchableOpacity>
-          </View>
-        </View>
-
-        <Text style={styles.sectionTitle}>Add Activity Manually</Text>
-        <View style={styles.manualCard}>
-          <TextInput
-            style={styles.manualInput}
-            placeholder="Activity title"
-            placeholderTextColor="#9aa0a6"
-            value={manualTitle}
-            onChangeText={setManualTitle}
-          />
-          <View style={styles.manualRow}>
-            <TextInput
-              style={[styles.manualInput, styles.manualInputHalf]}
-              placeholder="Date (dd/mm/yyyy)"
-              placeholderTextColor="#9aa0a6"
-              value={manualDate}
-              onChangeText={setManualDate}
-            />
-            <TextInput
-              style={[styles.manualInput, styles.manualInputHalf]}
-              placeholder="Time (9:00-10:00am)"
-              placeholderTextColor="#9aa0a6"
-              value={manualTime}
-              onChangeText={setManualTime}
-            />
-          </View>
-          <TouchableOpacity
-            style={styles.addActivityBtn}
-            onPress={addManualActivity}
-          >
-            <Text style={styles.addActivityText}>Add Activity</Text>
-          </TouchableOpacity>
-          {manualActivities.map((item) => (
-            <View key={item.id} style={styles.activityItem}>
-              <Text style={styles.activityTitle}>{item.title}</Text>
-              <Text style={styles.activityMeta}>
-                {item.date} | {item.time}
-              </Text>
+        {pendingItems.length === 0 && (
+          <Text style={styles.emptyText}>No pending items right now.</Text>
+        )}
+        {pendingItems.map((it) => (
+          <View key={it.id} style={styles.card}>
+            <Text style={styles.cardTime}>
+              {it.dateISO} {it.timeLabel || ""}
+            </Text>
+            <Text style={styles.cardTask}>{it.title}</Text>
+            <View style={styles.btnRow}>
+              <TouchableOpacity
+                style={styles.btnConfirm}
+                onPress={() => actions.confirmPending(it.id)}
+              >
+                <Text style={styles.btnConfirmText}>✓ Confirm</Text>
+              </TouchableOpacity>
+              <TouchableOpacity
+                style={styles.btnCancel}
+                onPress={() => actions.deleteItem(it.id)}
+              >
+                <Text style={styles.btnCancelText}>✕ Cancel</Text>
+              </TouchableOpacity>
             </View>
-          ))}
-        </View>
+          </View>
+        ))}
 
         <Text style={styles.sectionTitle}>Active Missions</Text>
         <View style={styles.missionCard}>
@@ -358,6 +335,11 @@ const MenuScreen = () => {
           </TouchableOpacity>
           <View style={styles.miniCard}>
             <Text style={styles.miniCardTitle}>Statistic</Text>
+            <View style={styles.statRow}>
+              <Text style={styles.statText}>Telegram: {sourceCounts.telegram}</Text>
+              <Text style={styles.statText}>Email: {sourceCounts.email}</Text>
+              <Text style={styles.statText}>Spectrum: {sourceCounts.spectrum}</Text>
+            </View>
             <View style={styles.graphRow}>
               {weeklyStats.map((point, index) => (
                 <View
@@ -403,7 +385,7 @@ const styles = StyleSheet.create({
   timeText: { color: "#fff", fontSize: 13, fontWeight: "700", marginTop: 2 },
   content: { padding: 20, flex: 1 },
   contentContainer: {
-    paddingBottom: 130,
+    paddingBottom: 190,
   },
   searchBar: {
     backgroundColor: "#fff",
@@ -586,61 +568,6 @@ const styles = StyleSheet.create({
     color: COLORS.darkGray,
     fontWeight: "600",
   },
-  manualCard: {
-    backgroundColor: "#fff",
-    borderRadius: 12,
-    borderWidth: 1,
-    borderColor: "#dfe3e8",
-    padding: 12,
-    marginBottom: 18,
-  },
-  manualInput: {
-    borderWidth: 1,
-    borderColor: "#dfe3e8",
-    backgroundColor: "#f8fafc",
-    borderRadius: 10,
-    paddingHorizontal: 12,
-    paddingVertical: 10,
-    color: COLORS.darkGray,
-    marginBottom: 10,
-    fontSize: 13,
-  },
-  manualRow: {
-    flexDirection: "row",
-    justifyContent: "space-between",
-    gap: 8,
-  },
-  manualInputHalf: {
-    flex: 1,
-  },
-  addActivityBtn: {
-    backgroundColor: COLORS.primary,
-    borderRadius: 10,
-    paddingVertical: 10,
-    alignItems: "center",
-    marginBottom: 10,
-  },
-  addActivityText: {
-    color: "#fff",
-    fontWeight: "700",
-    fontSize: 12,
-  },
-  activityItem: {
-    borderTopWidth: 1,
-    borderTopColor: "#edf1f5",
-    paddingTop: 8,
-    marginTop: 8,
-  },
-  activityTitle: {
-    color: COLORS.darkGray,
-    fontWeight: "600",
-    fontSize: 13,
-  },
-  activityMeta: {
-    color: COLORS.textGray,
-    fontSize: 11,
-    marginTop: 2,
-  },
   bottomCards: {
     flexDirection: "row",
     justifyContent: "space-between",
@@ -688,6 +615,17 @@ const styles = StyleSheet.create({
     justifyContent: "space-between",
     width: "100%",
     paddingHorizontal: 4,
+  },
+  statRow: {
+    width: "100%",
+    marginBottom: 10,
+    gap: 4,
+  },
+  statText: {
+    fontSize: 11,
+    fontWeight: "700",
+    color: COLORS.textGray,
+    textAlign: "center",
   },
   graphBar: {
     width: 10,

@@ -1,39 +1,13 @@
-import { useEffect, useState } from "react";
-import { ScrollView, StyleSheet, Text, View } from "react-native";
+import { useEffect, useMemo, useState } from "react";
+import { Image, ScrollView, StyleSheet, Text, TouchableOpacity, View } from "react-native";
+import { useActivityStore } from "../store/ActivityProvider";
 import { COLORS } from "../constants/theme";
+import { cancelScheduledNotification } from "../services/notifications";
 
 const HistoryScreen = () => {
   const [currentTime, setCurrentTime] = useState(new Date());
-  const historyItems = [
-    {
-      id: 1,
-      date: "Mar 29, 2025",
-      time: "8:00AM - 10:00AM",
-      title: "CM Lecture",
-      status: "completed",
-    },
-    {
-      id: 2,
-      date: "Mar 29, 2025",
-      time: "2:00PM - 4:00PM",
-      title: "Viva 1",
-      status: "completed",
-    },
-    {
-      id: 3,
-      date: "Mar 29, 2025",
-      time: "9:00AM - 12:00AM",
-      title: "DS Tutorial",
-      status: "completed",
-    },
-    {
-      id: 4,
-      date: "Mar 29, 2025",
-      time: "11:24PM",
-      title: "DS Tutorial submitted",
-      status: "submitted",
-    },
-  ];
+  const { state, actions } = useActivityStore();
+  const [selectedFilters, setSelectedFilters] = useState([]);
 
   useEffect(() => {
     const timer = setInterval(() => setCurrentTime(new Date()), 1000);
@@ -64,6 +38,48 @@ const HistoryScreen = () => {
     return `${hours}:${minutes}`;
   };
 
+  const filterOptions = [
+    {
+      id: "telegram",
+      label: "Telegram",
+      image: require("../../assets/telegram.png"),
+      color: "#0088cc",
+    },
+    {
+      id: "email",
+      label: "Email",
+      image: require("../../assets/email.png"),
+      color: "#EA4335",
+    },
+    {
+      id: "spectrum",
+      label: "Spectrum",
+      image: require("../../assets/spectrum.png"),
+      color: "#4285F4",
+    },
+    {
+      id: "manual",
+      label: "Manual",
+      image: require("../../assets/homepage.png"),
+      color: COLORS.primary,
+    },
+  ];
+
+  const toggleFilter = (id) => {
+    setSelectedFilters((prev) => (prev.includes(id) ? prev.filter((x) => x !== id) : [...prev, id]));
+  };
+
+  const historyItems = useMemo(() => {
+    const completed = state.items.filter((it) => it.status === "completed");
+    const filtered =
+      selectedFilters.length === 0
+        ? completed
+        : completed.filter((it) => selectedFilters.includes(it.source));
+    return filtered
+      .slice()
+      .sort((a, b) => (b.completedAtISO || "").localeCompare(a.completedAtISO || ""));
+  }, [state.items, selectedFilters]);
+
   return (
     <View style={styles.container}>
       <View style={styles.header}>
@@ -80,15 +96,59 @@ const HistoryScreen = () => {
       >
         <Text style={styles.sectionTitle}>Task History</Text>
 
+        <View style={styles.filterRow}>
+          {filterOptions.map((filter) => (
+            <TouchableOpacity
+              key={filter.id}
+              style={[
+                styles.filterBtn,
+                selectedFilters.includes(filter.id) && {
+                  backgroundColor: filter.color,
+                  borderColor: filter.color,
+                },
+              ]}
+              onPress={() => toggleFilter(filter.id)}
+            >
+              <Image source={filter.image} style={styles.filterIcon} />
+              <Text
+                style={[
+                  styles.filterLabel,
+                  selectedFilters.includes(filter.id) && { color: "#fff" },
+                ]}
+              >
+                {filter.label}
+              </Text>
+            </TouchableOpacity>
+          ))}
+        </View>
+
+        {historyItems.length === 0 && (
+          <Text style={styles.emptyText}>No history matches your filter.</Text>
+        )}
+
         {historyItems.map((item) => (
           <View key={item.id} style={styles.historyCard}>
             <View style={styles.dateTag}>
-              <Text style={styles.dateTagText}>{item.date}</Text>
+              <Text style={styles.dateTagText}>{item.dateISO}</Text>
             </View>
             <View style={styles.cardContent}>
-              <Text style={styles.cardTime}>{item.time}</Text>
+              <Text style={styles.cardTime}>{item.timeLabel || ""}</Text>
               <Text style={styles.cardTitle}>{item.title}</Text>
+              <Text style={styles.cardMeta}>
+                {item.source.toUpperCase()} • {item.kind.toUpperCase()}
+              </Text>
             </View>
+            <TouchableOpacity
+              style={styles.deleteBtn}
+              onPress={async () => {
+                if (item.notificationId) {
+                  await cancelScheduledNotification(item.notificationId);
+                }
+                actions.deleteItem(item.id);
+              }}
+            >
+              <Text style={styles.deleteText}>Delete</Text>
+            </TouchableOpacity>
           </View>
         ))}
       </ScrollView>
@@ -134,13 +194,43 @@ const styles = StyleSheet.create({
   },
   content: {
     padding: 20,
-    paddingBottom: 130,
+    paddingBottom: 190,
   },
   sectionTitle: {
     fontSize: 18,
     fontWeight: "bold",
     marginBottom: 20,
     color: COLORS.darkGray,
+  },
+  filterRow: {
+    flexDirection: "row",
+    justifyContent: "space-between",
+    marginBottom: 18,
+    gap: 8,
+  },
+  filterBtn: {
+    flex: 1,
+    backgroundColor: "#fff",
+    borderWidth: 2,
+    borderColor: "#e0e0e0",
+    borderRadius: 10,
+    paddingVertical: 10,
+    paddingHorizontal: 8,
+    alignItems: "center",
+    justifyContent: "center",
+  },
+  filterIcon: { width: 18, height: 18, marginBottom: 5, resizeMode: "contain" },
+  filterLabel: {
+    fontSize: 10,
+    fontWeight: "700",
+    color: COLORS.textGray,
+    textAlign: "center",
+  },
+  emptyText: {
+    fontSize: 12,
+    color: COLORS.textGray,
+    marginBottom: 10,
+    fontStyle: "italic",
   },
   historyCard: {
     flexDirection: "row",
@@ -180,6 +270,25 @@ const styles = StyleSheet.create({
     fontSize: 14,
     fontWeight: "600",
     color: COLORS.darkGray,
+  },
+  cardMeta: {
+    marginTop: 4,
+    fontSize: 10,
+    fontWeight: "700",
+    color: COLORS.textGray,
+  },
+  deleteBtn: {
+    alignSelf: "center",
+    borderWidth: 1.5,
+    borderColor: "#ef4444",
+    borderRadius: 12,
+    paddingVertical: 6,
+    paddingHorizontal: 10,
+  },
+  deleteText: {
+    color: "#ef4444",
+    fontWeight: "900",
+    fontSize: 11,
   },
 });
 
