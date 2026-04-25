@@ -1,7 +1,6 @@
 import * as AuthSession from "expo-auth-session";
-import Constants from "expo-constants";
 import * as WebBrowser from "expo-web-browser";
-import { useEffect, useState } from "react";
+import { useEffect, useMemo, useState } from "react";
 import {
   Alert,
   Image,
@@ -32,22 +31,24 @@ export default function SettingScreen() {
   const functionsBaseUrl = (
     process.env.EXPO_PUBLIC_FUNCTIONS_BASE_URL ?? ""
   ).replace(/\/$/, "");
-  const configuredProxyRedirectUri = (
-    process.env.EXPO_PUBLIC_GOOGLE_OAUTH_REDIRECT_URI ?? ""
-  ).trim();
-  const expoOwner = Constants.expoConfig?.owner;
-  const expoSlug = Constants.expoConfig?.slug;
-  const computedProxyRedirectUri =
-    expoOwner && expoSlug
-      ? `https://auth.expo.io/@${expoOwner}/${expoSlug}`
-      : "";
-  const redirectUri = configuredProxyRedirectUri || computedProxyRedirectUri;
+  const redirectUri = useMemo(() => {
+    const rawUri =
+      process.env.EXPO_PUBLIC_GOOGLE_OAUTH_REDIRECT_URI ??
+      AuthSession.makeRedirectUri({
+        // @ts-expect-error - `useProxy` exists in Expo AuthSession runtime, but may be missing from types
+        useProxy: true,
+      });
+    const cleanUri = rawUri.replace(/\/$/, "");
+    console.log("[SettingScreen] Using Redirect URI:", cleanUri);
+    return cleanUri;
+  }, []);
 
   const [request, response, promptAsync] = AuthSession.useAuthRequest(
     {
       clientId: googleClientId,
       redirectUri,
       responseType: AuthSession.ResponseType.Code,
+      usePKCE: false,
       scopes: [
         "openid",
         "email",
@@ -144,48 +145,18 @@ export default function SettingScreen() {
       setStatusText("Please enter userId first.");
       return;
     }
-
     if (!request?.url) {
       setStatusText("Auth request not ready yet. Please try again.");
       return;
     }
 
-    if (!redirectUri) {
-      setStatusText(
-        "Missing redirect URI. Set EXPO_PUBLIC_GOOGLE_OAUTH_REDIRECT_URI to https://auth.expo.io/@<owner>/<slug> for Expo Go.",
-      );
-      return;
-    }
-
-    if (configuredProxyRedirectUri) {
-      if (configuredProxyRedirectUri.includes("auth,expo.io")) {
-        setStatusText(
-          "Your EXPO_PUBLIC_GOOGLE_OAUTH_REDIRECT_URI has a typo: use https://auth.expo.io (dot), not auth,expo.io (comma).",
-        );
-        return;
-      }
-      if (!configuredProxyRedirectUri.startsWith("https://auth.expo.io/")) {
-        setStatusText(
-          "EXPO_PUBLIC_GOOGLE_OAUTH_REDIRECT_URI must start with https://auth.expo.io/@<owner>/<slug> when using Expo Go.",
-        );
-        return;
-      }
-    }
-
-    if (computedProxyRedirectUri && redirectUri !== computedProxyRedirectUri) {
-      setStatusText(
-        `Redirect URI mismatch.\n\nConfigured/Using:\n${redirectUri}\n\nExpected from app config (owner+slug):\n${computedProxyRedirectUri}\n\nFix: update EXPO_PUBLIC_GOOGLE_OAUTH_REDIRECT_URI to the expected value and restart Expo with -c.`,
-      );
-      return;
-    }
-
-    const returnUrl = AuthSession.getDefaultReturnUrl();
-    const startUrl = `${redirectUri}/start?authUrl=${encodeURIComponent(
-      request.url,
-    )}&returnUrl=${encodeURIComponent(returnUrl)}`;
-
     setIsConnecting(true);
     try {
+      const returnUrl = AuthSession.getDefaultReturnUrl();
+      const startUrl = `${redirectUri}/start?authUrl=${encodeURIComponent(
+        request.url,
+      )}&returnUrl=${encodeURIComponent(returnUrl)}`;
+
       const authResult = await promptAsync({ url: startUrl });
 
       if (authResult.type !== "success") {

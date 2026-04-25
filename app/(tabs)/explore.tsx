@@ -37,13 +37,15 @@ export default function TabTwoScreen() {
     // In Expo Go, the proxy redirect is the easiest path.
     // If you need to force a specific redirect URI (e.g., one you registered in Google Cloud Console),
     // set EXPO_PUBLIC_GOOGLE_OAUTH_REDIRECT_URI.
-    return (
+    const rawUri =
       process.env.EXPO_PUBLIC_GOOGLE_OAUTH_REDIRECT_URI ??
       AuthSession.makeRedirectUri({
         // @ts-expect-error - `useProxy` exists in Expo AuthSession runtime, but may be missing from types
         useProxy: true,
-      })
-    );
+      });
+    const cleanUri = rawUri.replace(/\/$/, "");
+    console.log("[Explore] Using Redirect URI:", cleanUri);
+    return cleanUri;
   }, []);
 
   const [request, response, promptAsync] = AuthSession.useAuthRequest(
@@ -51,6 +53,7 @@ export default function TabTwoScreen() {
       clientId: googleClientId,
       redirectUri,
       responseType: AuthSession.ResponseType.Code,
+      usePKCE: false,
       scopes: [
         "openid",
         "email",
@@ -81,13 +84,19 @@ export default function TabTwoScreen() {
       setStatusText("Please enter a userId (Firestore document id).");
       return;
     }
+    if (!request?.url) {
+      setStatusText("Auth request not ready. Please try again.");
+      return;
+    }
 
     setIsWorking(true);
     try {
-      const authResult = await promptAsync({
-        // @ts-expect-error - `useProxy` exists in Expo AuthSession runtime, but may be missing from types
-        useProxy: true,
-      });
+      const returnUrl = AuthSession.getDefaultReturnUrl();
+      const startUrl = `${redirectUri}/start?authUrl=${encodeURIComponent(
+        request.url,
+      )}&returnUrl=${encodeURIComponent(returnUrl)}`;
+
+      const authResult = await promptAsync({ url: startUrl });
 
       if (authResult.type !== "success") {
         setStatusText(`Login cancelled (${authResult.type}).`);
