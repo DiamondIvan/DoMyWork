@@ -1,14 +1,14 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import {
-  Alert,
-  Image,
-  Linking,
-  ScrollView,
-  StyleSheet,
-  Text,
-  TextInput,
-  TouchableOpacity,
-  View,
+    Alert,
+    Image,
+    Linking,
+    ScrollView,
+    StyleSheet,
+    Text,
+    TextInput,
+    TouchableOpacity,
+    View,
 } from "react-native";
 import { defaultUserId, enqueueAutomationRequest } from "../constants/backend";
 import { COLORS } from "../constants/theme";
@@ -33,7 +33,9 @@ const MenuScreen = () => {
       if (!res.ok) return;
       const json = await res.json();
       setFirestorePending(json.tasks ?? []);
-    } catch { /* silent — network may not be ready yet */ }
+    } catch {
+      /* silent — network may not be ready yet */
+    }
   }, []);
 
   useEffect(() => {
@@ -48,17 +50,44 @@ const MenuScreen = () => {
       const res = await fetch(`${BASE_URL}/pendingTasks/${task.id}/confirm`, {
         method: "POST",
       });
+      const json = await res.json().catch(() => null);
+      console.log("[Confirm] response:", res.status, JSON.stringify(json));
+
       if (res.ok) {
         setFirestorePending((prev) => prev.filter((t) => t.id !== task.id));
+
+        const eventId = json?.calendarEventId;
+        const eventLink = json?.calendarEventLink;  // direct link to the created event
+        // Fallback: open calendar home if no direct link
+        const openUrl = eventLink || "https://calendar.google.com/calendar/u/0/r";
+
         Alert.alert(
-          "Task Confirmed",
-          `"${task.title}" has been queued for Google Calendar.`,
+          eventId ? "✅ Event Created" : "Task Confirmed",
+          eventId
+            ? `Event "${task.title}" was added to Google Calendar.\n\nTap "Open Event" to view it. Make sure you're signed in to the same Google account used in Settings.`
+            : `"${task.title}" has been queued — it will be processed shortly by the backend.`,
+          [
+            {
+              text: eventId ? "Open Event" : "Open Calendar",
+              onPress: async () => {
+                const canOpen = await Linking.canOpenURL(openUrl);
+                if (canOpen) {
+                  await Linking.openURL(openUrl);
+                } else {
+                  await Linking.openURL("https://calendar.google.com/calendar/u/0/r");
+                }
+              },
+            },
+            { text: "OK", style: "cancel" },
+          ],
         );
       } else {
-        Alert.alert("Error", "Could not confirm task.");
+        // Surface the actual error from the backend
+        const detail = json?.detail ?? `Server error ${res.status}`;
+        Alert.alert("❌ Confirm Failed", detail);
       }
-    } catch {
-      Alert.alert("Error", "Network error.");
+    } catch (e) {
+      Alert.alert("Error", e?.message ?? "Network error — is the backend running?");
     } finally {
       setConfirmingId(null);
     }
@@ -68,13 +97,30 @@ const MenuScreen = () => {
     try {
       await fetch(`${BASE_URL}/pendingTasks/${task.id}`, { method: "DELETE" });
       setFirestorePending((prev) => prev.filter((t) => t.id !== task.id));
-    } catch { /* ignore */ }
+    } catch {
+      /* ignore */
+    }
   };
   const [messages] = useState([
-    { id: 1, source: "telegram", title: "Assignment due next Friday", time: "14:02" },
+    {
+      id: 1,
+      source: "telegram",
+      title: "Assignment due next Friday",
+      time: "14:02",
+    },
     { id: 2, source: "email", title: "Exam venue: Hall B", time: "13:45" },
-    { id: 3, source: "web", title: "New course material uploaded", time: "12:30" },
-    { id: 4, source: "telegram", title: "Group discussion link", time: "11:15" },
+    {
+      id: 3,
+      source: "web",
+      title: "New course material uploaded",
+      time: "12:30",
+    },
+    {
+      id: 4,
+      source: "telegram",
+      title: "Group discussion link",
+      time: "11:15",
+    },
   ]);
   const [backendStatus, setBackendStatus] = useState("");
 
@@ -154,8 +200,10 @@ const MenuScreen = () => {
       _source: "firestore",
       _raw: t,
     }));
-    return [...remote, ...local].sort(
-      (a, b) => (b.createdAt || b.dateISO || "").localeCompare(a.createdAt || a.dateISO || ""),
+    return [...remote, ...local].sort((a, b) =>
+      (b.createdAt || b.dateISO || "").localeCompare(
+        a.createdAt || a.dateISO || "",
+      ),
     );
   }, [state.items, firestorePending]);
 
@@ -184,7 +232,9 @@ const MenuScreen = () => {
     });
 
     const completed = state.items.filter((it) => it.status === "completed");
-    const counts = days.map((iso) => completed.filter((it) => it.dateISO === iso).length);
+    const counts = days.map(
+      (iso) => completed.filter((it) => it.dateISO === iso).length,
+    );
     return counts;
   }, [state.items]);
 
@@ -321,7 +371,9 @@ const MenuScreen = () => {
 
         <Text style={styles.sectionTitle}>Pending Confirmation</Text>
         {pendingItems.length === 0 && (
-          <Text style={styles.emptyText}>No pending items — AI is watching your selected chats.</Text>
+          <Text style={styles.emptyText}>
+            No pending items — AI is watching your selected chats.
+          </Text>
         )}
         {pendingItems.map((it) => (
           <View key={it.id} style={styles.card}>
@@ -335,18 +387,20 @@ const MenuScreen = () => {
             {it.taskType === "create_calendar_event" && it.payload && (
               <View style={styles.payloadBox}>
                 {it.payload.start ? (
-                  <Text style={styles.payloadText}>🗓  {it.payload.start?.replace("T", "  ")}</Text>
+                  <Text style={styles.payloadText}>
+                    🗓 {it.payload.start?.replace("T", "  ")}
+                  </Text>
                 ) : null}
                 {it.payload.description ? (
                   <Text style={styles.payloadText} numberOfLines={2}>
-                    📝  {it.payload.description}
+                    📝 {it.payload.description}
                   </Text>
                 ) : null}
               </View>
             )}
             {it.taskType === "send_email" && it.payload && (
               <View style={styles.payloadBox}>
-                <Text style={styles.payloadText}>✉️  To: {it.payload.to}</Text>
+                <Text style={styles.payloadText}>✉️ To: {it.payload.to}</Text>
                 {it.payload.bodyText ? (
                   <Text style={styles.payloadText} numberOfLines={2}>
                     {it.payload.bodyText}
@@ -356,7 +410,10 @@ const MenuScreen = () => {
             )}
             <View style={styles.btnRow}>
               <TouchableOpacity
-                style={[styles.btnConfirm, confirmingId === it.id && { opacity: 0.6 }]}
+                style={[
+                  styles.btnConfirm,
+                  confirmingId === it.id && { opacity: 0.6 },
+                ]}
                 disabled={confirmingId === it.id}
                 onPress={() =>
                   it._source === "firestore"
@@ -422,9 +479,13 @@ const MenuScreen = () => {
           <View style={styles.miniCard}>
             <Text style={styles.miniCardTitle}>Statistic</Text>
             <View style={styles.statRow}>
-              <Text style={styles.statText}>Telegram: {sourceCounts.telegram}</Text>
+              <Text style={styles.statText}>
+                Telegram: {sourceCounts.telegram}
+              </Text>
               <Text style={styles.statText}>Email: {sourceCounts.email}</Text>
-              <Text style={styles.statText}>Spectrum: {sourceCounts.spectrum}</Text>
+              <Text style={styles.statText}>
+                Spectrum: {sourceCounts.spectrum}
+              </Text>
             </View>
             <View style={styles.graphRow}>
               {weeklyStats.map((point, index) => (

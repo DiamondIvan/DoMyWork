@@ -2,6 +2,8 @@ import io
 import json
 import os
 import sys
+from urllib.parse import quote
+from datetime import datetime
 
 # Force UTF-8 output so Windows terminals don't crash on non-ASCII characters
 if hasattr(sys.stdout, "buffer"):
@@ -90,6 +92,7 @@ async def chat_endpoint(req: ChatMessageReq):
     if not ILMU_API_KEY:
         raise HTTPException(status_code=500, detail="Missing ILMU_API_KEY in .env")
 
+    current_time_str = datetime.now().strftime("%A, %B %d, %Y %H:%M:%S")
     headers = {
         "Authorization": f"Bearer {ILMU_API_KEY}",
         "Content-Type": "application/json",
@@ -101,6 +104,7 @@ async def chat_endpoint(req: ChatMessageReq):
                 "role": "system",
                 "content": (
                     "You are Crow AI, a helpful scheduling assistant. "
+                    f"The current date and time is {current_time_str}. "
                     "You help users manage their tasks, calendar events, and reminders. "
                     "Be concise and friendly."
                 ),
@@ -223,6 +227,89 @@ def set_selected_chats(req: SetSelectedChatsReq):
     return {"chatIds": req.chatIds, "saved": True}
 
 # =====================================================================
+# Google OAuth — exchange authorization code for refresh token
+# Replaces the Firebase Cloud Function so the app can use one backend.
+# =====================================================================
+
+class ExchangeGoogleCodeReq(BaseModel):
+    userId: str
+    code: str
+    redirectUri: Optional[str] = None
+
+@app.post("/exchangeGoogleCode")
+def exchange_google_code(req: ExchangeGoogleCodeReq):
+    """Exchange a Google OAuth authorization code for a refresh token,
+    then store it in Firestore at users/{userId}/integrations/google."""
+    client_id = get_env("GOOGLE_OAUTH_CLIENT_ID")
+    client_secret = get_env("GOOGLE_OAUTH_CLIENT_SECRET")
+    configured_redirect_uri = get_env("GOOGLE_OAUTH_REDIRECT_URI")
+
+    if not client_id or not client_secret:
+        raise HTTPException(status_code=500, detail="Missing GOOGLE_OAUTH_CLIENT_ID or GOOGLE_OAUTH_CLIENT_SECRET in .env")
+
+    # Validate redirect URI matches what the OAuth app expects
+    redirect_uri_to_use = req.redirectUri or configured_redirect_uri
+    if configured_redirect_uri and req.redirectUri and req.redirectUri != configured_redirect_uri:
+        raise HTTPException(
+            status_code=400,
+            detail=f"redirectUri mismatch. App sent '{req.redirectUri}', backend expects '{configured_redirect_uri}'."
+        )
+
+    # Exchange auth code for tokens
+    token_resp = requests.post(
+        "https://oauth2.googleapis.com/token",
+        data={
+            "code": req.code,
+            "client_id": client_id,
+            "client_secret": client_secret,
+            "redirect_uri": redirect_uri_to_use,
+            "grant_type": "authorization_code",
+        },
+        timeout=30,
+    )
+
+    print(f"[OAUTH] Token exchange status={token_resp.status_code} userId={req.userId}")
+
+    if token_resp.status_code != 200:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Google token exchange failed ({token_resp.status_code}): {token_resp.text}",
+        )
+
+    tokens = token_resp.json()
+    refresh_token = tokens.get("refresh_token")
+
+    if not refresh_token:
+        # This happens when the user already granted access before and Google doesn't
+        # re-issue a refresh token. Revoking access at myaccount.google.com/permissions
+        # and reconnecting will fix it.
+        print(f"[OAUTH] ⚠️  No refresh_token returned for userId={req.userId}. User may need to revoke and re-grant access.")
+        return {
+            "ok": True,
+            "hasRefreshToken": False,
+            "message": (
+                "No refresh_token returned. Revoke app access at "
+                "https://myaccount.google.com/permissions then reconnect."
+            ),
+        }
+
+    # Persist the refresh token in Firestore
+    db, fs_mod = _get_firestore_client()
+    if db is None:
+        raise HTTPException(status_code=503, detail="Firebase not configured — check GOOGLE_APPLICATION_CREDENTIALS in .env")
+
+    db.collection("users").document(req.userId).collection("integrations").document("google").set(
+        {
+            "refreshToken": refresh_token,
+            "updatedAt": fs_mod.SERVER_TIMESTAMP,
+        },
+        merge=True,
+    )
+    print(f"[OAUTH] ✅ Refresh token stored for userId={req.userId}")
+    return {"ok": True, "hasRefreshToken": True}
+
+
+# =====================================================================
 # Pending Tasks — AI-detected tasks waiting for user confirmation
 # =====================================================================
 
@@ -248,6 +335,106 @@ def _get_firestore_client():
             return None, None
 
     return fs.client(), fs
+
+def _get_google_refresh_token(db, user_id: str) -> Optional[str]:
+    token_doc = db.collection("users").document(user_id).collection("integrations").document("google").get()
+    if not token_doc.exists:
+        return None
+    data = token_doc.to_dict() or {}
+    token = data.get("refreshToken")
+    return token if isinstance(token, str) and token.strip() else None
+
+def _create_google_calendar_event_immediately(db, user_id: str, payload: dict) -> dict:
+    client_id = get_env("GOOGLE_OAUTH_CLIENT_ID")
+    client_secret = get_env("GOOGLE_OAUTH_CLIENT_SECRET")
+    if not client_id or not client_secret:
+        raise RuntimeError("Missing GOOGLE_OAUTH_CLIENT_ID or GOOGLE_OAUTH_CLIENT_SECRET in .env")
+
+    print(f"[CAL] Creating event for userId='{user_id}' payload={payload}")
+
+    refresh_token = _get_google_refresh_token(db, user_id)
+    if not refresh_token:
+        raise RuntimeError(
+            f"Missing Google refresh token for userId '{user_id}'. Reconnect Google in Settings."
+        )
+    print(f"[CAL] Refresh token found (length={len(refresh_token)})")
+
+    token_resp = requests.post(
+        "https://oauth2.googleapis.com/token",
+        data={
+            "client_id": client_id,
+            "client_secret": client_secret,
+            "refresh_token": refresh_token,
+            "grant_type": "refresh_token",
+        },
+        timeout=30,
+    )
+    print(f"[CAL] Token refresh status={token_resp.status_code}")
+    if token_resp.status_code != 200:
+        raise RuntimeError(f"Google token refresh failed ({token_resp.status_code}): {token_resp.text}")
+
+    access_token = token_resp.json().get("access_token")
+    if not access_token:
+        raise RuntimeError("Google token refresh succeeded but access_token was missing")
+    print("[CAL] Access token obtained successfully")
+
+    calendar_id = payload.get("calendarId") or "primary"
+
+    # Build start/end — always include timeZone so Google doesn't reject ambiguous datetimes.
+    # If the AI included an offset (e.g. +08:00) the dateTime is already unambiguous;
+    # the timeZone field is still accepted and harmless.
+    DEFAULT_TIMEZONE = "Asia/Kuala_Lumpur"
+    start_dt = payload.get("start")
+    end_dt = payload.get("end")
+
+    if not start_dt or not end_dt:
+        raise RuntimeError(
+            f"Payload is missing start or end datetime. Got start={start_dt!r}, end={end_dt!r}. "
+            "The AI may not have extracted the event time correctly."
+        )
+
+    event_body: dict = {
+        "summary": payload.get("summary") or "Untitled Event",
+        "start": {"dateTime": start_dt, "timeZone": DEFAULT_TIMEZONE},
+        "end": {"dateTime": end_dt, "timeZone": DEFAULT_TIMEZONE},
+    }
+
+    # Only include optional fields when they are non-null — Google rejects explicit null values.
+    description = payload.get("description")
+    if description:
+        event_body["description"] = description
+
+    attendees = payload.get("attendees")
+    if isinstance(attendees, list) and attendees:
+        event_body["attendees"] = [{"email": str(email)} for email in attendees if email]
+
+    print(f"[CAL] Sending event body to Google: {event_body}")
+
+    create_resp = requests.post(
+        f"https://www.googleapis.com/calendar/v3/calendars/{quote(str(calendar_id), safe='')}/events",
+        headers={
+            "Authorization": f"Bearer {access_token}",
+            "Content-Type": "application/json",
+        },
+        json=event_body,
+        timeout=30,
+    )
+    print(f"[CAL] Google Calendar API response status={create_resp.status_code}")
+    print(f"[CAL] Google Calendar API response body={create_resp.text[:500]}")
+
+    if create_resp.status_code not in (200, 201):
+        raise RuntimeError(
+            f"Google Calendar create event failed ({create_resp.status_code}): {create_resp.text}"
+        )
+
+    event = create_resp.json()
+    event_id = event.get("id")
+    html_link = event.get("htmlLink")
+    print(f"[CAL] ✅ Event created! id={event_id} link={html_link}")
+    return {
+        "id": event_id,
+        "htmlLink": html_link,
+    }
 
 @app.get("/pendingTasks")
 def get_pending_tasks():
@@ -306,6 +493,7 @@ def confirm_pending_task(task_id: str):
             "payload": data["payload"],
             "status": "queued",
             "createdAt": fs_mod.SERVER_TIMESTAMP,
+            "updatedAt": fs_mod.SERVER_TIMESTAMP,
             "source": {
                 "telegram": {
                     "chatId": data.get("chatId"),
@@ -315,6 +503,29 @@ def confirm_pending_task(task_id: str):
                 }
             },
         }
+        # Calendar confirmations are executed immediately here so users get reliable behavior
+        # even when Firestore-trigger workers are unavailable.
+        if data.get("type") == "create_calendar_event":
+            try:
+                result = _create_google_calendar_event_immediately(db, user_id, data.get("payload", {}))
+            except Exception as e:
+                raise HTTPException(status_code=400, detail=str(e))
+
+            automation_doc["status"] = "done"
+            automation_doc["result"] = result
+            _, ref = db.collection("automationRequests").add(automation_doc)
+            task_ref.delete()
+            print(
+                f"✅ [CONFIRM] Calendar event created immediately. automationRequest={ref.id}, "
+                f"userId={user_id}, eventId={result.get('id')}"
+            )
+            return {
+                "confirmed": True,
+                "automationRequestId": ref.id,
+                "calendarEventId": result.get("id"),
+                "calendarEventLink": result.get("htmlLink"),
+            }
+
         _, ref = db.collection("automationRequests").add(automation_doc)
         task_ref.delete()
         print(f"✅ [CONFIRM] Task '{data.get('type')}' confirmed. automationRequest={ref.id}, userId={user_id}")
@@ -439,6 +650,7 @@ async def process_message(req: ChatMessageReq):
     if not ILMU_API_KEY:
         raise HTTPException(status_code=500, detail="Missing ILMU_API_KEY in .env")
     
+    current_time_str = datetime.now().strftime("%A, %B %d, %Y %H:%M:%S")
     try:
         headers = {
             "Authorization": f"Bearer {ILMU_API_KEY}",
@@ -451,6 +663,7 @@ async def process_message(req: ChatMessageReq):
                     "role": "system",
                     "content": (
                         "You are Crow AI, a helpful scheduling assistant for Telegram. "
+                        f"The current date and time is {current_time_str}. "
                         "You help users manage their tasks, calendar events, and reminders. "
                         "Keep responses concise and friendly. "
                         "If the user asks to create a calendar event or send an email, acknowledge and tell them you'll help."

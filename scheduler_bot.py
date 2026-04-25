@@ -13,7 +13,9 @@ if hasattr(sys.stderr, "reconfigure"):
 import asyncio
 import json
 import hashlib
+import contextlib
 from typing import Any, Optional
+from datetime import datetime
 import requests
 from requests.exceptions import ReadTimeout, ConnectionError as RequestsConnectionError
 
@@ -132,12 +134,13 @@ ILMU_BASE_URL = get_env("ILMU_BASE_URL", default="https://api.ilmu.ai/v1/chat/co
 ILMU_MODEL = get_env("ILMU_MODEL", default="ilmu-glm-5.1")
 ILMU_TIMEOUT_SECONDS = get_env_int("ILMU_TIMEOUT_SECONDS", fallback_names=["ILMU_TIMEOUT"], default=120)
 ILMU_MAX_RETRIES = get_env_int("ILMU_MAX_RETRIES", default=2)
+AI_DETECTION_RETRY_INTERVAL_SECONDS = get_env_int("AI_DETECTION_RETRY_INTERVAL_SECONDS", default=45)
 
-def call_ilmu_ai(system_prompt: str, user_content: str) -> Optional[str]:
-    """Helper to call Ilmu AI via HTTP requests."""
+def call_ilmu_ai(system_prompt: str, user_content: str) -> tuple[Optional[str], bool]:
+    """Call Ilmu AI and return (content, retryable_failure)."""
     if not ILMU_API_KEY:
         print("❌ Missing ILMU_API_KEY in .env")
-        return None
+        return None, False
 
     headers = {
         "Authorization": f"Bearer {ILMU_API_KEY}",
@@ -162,14 +165,24 @@ def call_ilmu_ai(system_prompt: str, user_content: str) -> Optional[str]:
                 timeout=max(30, ILMU_TIMEOUT_SECONDS),
             )
             if response.status_code == 200:
-                return response.json()["choices"][0]["message"]["content"].strip()
+                return response.json()["choices"][0]["message"]["content"].strip(), False
 
-            print(f"⚠️ Ilmu API Error {response.status_code}: {response.text}")
-            return None
+            # Avoid dumping huge Cloudflare/HTML bodies into logs.
+            body = (response.text or "").strip()
+            short_body = body[:240] + ("..." if len(body) > 240 else "")
+            if response.status_code >= 500:
+                print(
+                    f"⚠️ Ilmu API upstream error {response.status_code}. "
+                    "Service is temporarily unavailable; task detection skipped for this message."
+                )
+                return None, True
+            else:
+                print(f"⚠️ Ilmu API Error {response.status_code}: {short_body}")
+                return None, False
         except (ReadTimeout, RequestsConnectionError) as e:
             if attempt >= attempts:
                 print(f"❌ Ilmu Request Failed after {attempt} attempt(s): {e}")
-                return None
+                return None, True
             backoff_seconds = attempt * 2
             print(
                 f"⚠️ Ilmu transient network issue on attempt {attempt}/{attempts}; retrying in {backoff_seconds}s... ({e})"
@@ -178,7 +191,8 @@ def call_ilmu_ai(system_prompt: str, user_content: str) -> Optional[str]:
             time.sleep(backoff_seconds)
         except Exception as e:
             print(f"❌ Ilmu Request Failed: {e}")
-            return None
+            return None, True
+    return None, True
 
 # =====================================================================
 # GPT-4o-mini Integration (Replacement for Ilmu/Gemini)
@@ -212,7 +226,10 @@ def describe_image_with_gpt(image_path: str) -> str:
 # =====================================================================
 # Configuration: Enable/disable interactive AI responses
 # =====================================================================
-ENABLE_AI_RESPONSES = get_env("ENABLE_TELEGRAM_AI_RESPONSES", default="true").lower() in ["true", "1", "yes"]
+# Auto-reply to chat messages is opt-in; task detection still runs regardless.
+ENABLE_AI_RESPONSES = get_env("ENABLE_TELEGRAM_AI_RESPONSES", default="false").lower() in ["true", "1", "yes"]
+ENABLE_AI_TASK_DETECTION = get_env("ENABLE_TELEGRAM_AI_TASK_DETECTION", default="false").lower() in ["true", "1", "yes"]
+ENABLE_AI_DETECTION_RETRY_QUEUE = get_env("ENABLE_AI_DETECTION_RETRY_QUEUE", default="true").lower() in ["true", "1", "yes"]
 
 # =====================================================================
 # Firestore (lazy init)
@@ -420,6 +437,51 @@ async def save_pending_task(
     )
 
 
+def _queue_detection_retry_sync(
+    *, chat_id: int, chat_title: str, sender: str, message_id: int, reason: str
+) -> Optional[str]:
+    db, firestore = _get_firestore()
+    if db is None or firestore is None:
+        return None
+
+    doc_id = f"{chat_id}_{message_id}"
+    ref = db.collection("aiDetectionRetries").document(doc_id)
+    snap = ref.get()
+    if snap.exists:
+        data = snap.to_dict() or {}
+        if data.get("status") in {"queued", "processing", "done", "no_action"}:
+            return doc_id
+
+    ref.set(
+        {
+            "chatId": chat_id,
+            "chatTitle": chat_title,
+            "sender": sender,
+            "triggerMessageId": message_id,
+            "status": "queued",
+            "attempts": 0,
+            "lastError": reason,
+            "createdAt": firestore.SERVER_TIMESTAMP,
+            "updatedAt": firestore.SERVER_TIMESTAMP,
+        },
+        merge=True,
+    )
+    return doc_id
+
+
+async def queue_detection_retry(
+    *, chat_id: int, chat_title: str, sender: str, message_id: int, reason: str
+) -> Optional[str]:
+    return await asyncio.to_thread(
+        _queue_detection_retry_sync,
+        chat_id=chat_id,
+        chat_title=chat_title,
+        sender=sender,
+        message_id=message_id,
+        reason=reason,
+    )
+
+
 def _confirm_pending_task_sync(task_id: str) -> bool:
     """Move a pending task to automationRequests (status=queued) and delete from pendingTasks.
 
@@ -459,11 +521,11 @@ def _confirm_pending_task_sync(task_id: str) -> bool:
 # =====================================================================
 # AI Pipeline — Ilmu reads chat history and detects actions
 # =====================================================================
-async def run_ai_pipeline(chat_id: int, chat_title: str) -> Optional[dict]:
+async def run_ai_pipeline(chat_id: int, chat_title: str) -> tuple[Optional[dict], bool]:
     # Fetch history from Firestore
     messages = await get_all_messages(chat_id)
     if not messages:
-        return None
+        return None, False
     print(f"🧠 [AI CONTEXT] Analyzing last {len(messages)} messages for actionable tasks...")
 
     # Format history for the AI context
@@ -472,8 +534,10 @@ async def run_ai_pipeline(chat_id: int, chat_title: str) -> Optional[dict]:
         f"{m.get('text') or '(media)'}"
         for m in messages
     )
+    current_time_str = datetime.now().strftime("%A, %B %d, %Y %H:%M:%S")
     system_prompt = (
         f"You are a strict scheduling assistant for the Telegram chat '{chat_title}'. "
+        f"The current date and time is {current_time_str}. Use this to resolve relative dates (e.g., 'tomorrow', 'next Friday') and ensure the correct year is used. "
         "Extract MANDATORY tasks (meetings, deadlines, emails) ONLY IF they are newly introduced or confirmed in the LATEST message. "
         "Ignore spam/ads and ignore tasks that were already finalized in older messages. "
         "You MUST respond ONLY with a valid JSON object or the word 'null'."
@@ -491,10 +555,13 @@ async def run_ai_pipeline(chat_id: int, chat_title: str) -> Optional[dict]:
     """
 
     # Run the request in a thread to keep the bot responsive
-    raw = await asyncio.to_thread(call_ilmu_ai, system_prompt, user_content)
+    raw, retryable_failure = await asyncio.to_thread(call_ilmu_ai, system_prompt, user_content)
+    if retryable_failure:
+        return None, True
+
     if not raw or raw.lower() == "null":
         print("💤 [AI RESULT] No mandatory tasks detected.")
-        return None
+        return None, False
     else:
         print(f"🎯 [AI RESULT] Task Found: {raw}")
 
@@ -502,25 +569,148 @@ async def run_ai_pipeline(chat_id: int, chat_title: str) -> Optional[dict]:
         # Strip potential markdown fences Ilmu might add
         if "```" in raw:
             raw = raw.split("```")[1].replace("json", "").strip()
-        return json.loads(raw)
+        return json.loads(raw), False
     except Exception as e:
         print(f"⚠️ AI JSON Error: {e} | Raw Output: {raw}")
-        return None
+        return None, False
 
 # =====================================================================
 # Generate AI response for interactive chat
 # =====================================================================
 async def generate_ai_response(message_text: str, chat_title: str) -> Optional[str]:
     """Generate a conversational AI response for a message."""
+    current_time_str = datetime.now().strftime("%A, %B %d, %Y %H:%M:%S")
     system_prompt = (
         f"You are Crow AI, a helpful scheduling assistant in the Telegram chat '{chat_title}'. "
+        f"The current date and time is {current_time_str}. "
         "Help users manage their tasks, calendar events, and reminders. "
         "Be concise, friendly, and helpful. Keep responses under 200 characters when possible. "
         "If the user asks you to create a task or event, acknowledge it and tell them you'll help."
     )
 
-    raw = await asyncio.to_thread(call_ilmu_ai, system_prompt, message_text)
+    raw, _ = await asyncio.to_thread(call_ilmu_ai, system_prompt, message_text)
     return raw if raw else None
+
+
+async def process_detection_retry_queue() -> None:
+    """Background worker that retries Ilmu task detection failures."""
+    while True:
+        await asyncio.sleep(max(15, AI_DETECTION_RETRY_INTERVAL_SECONDS))
+        if not ENABLE_AI_TASK_DETECTION or not ENABLE_AI_DETECTION_RETRY_QUEUE:
+            continue
+
+        db, firestore = _get_firestore()
+        if db is None or firestore is None:
+            continue
+
+        try:
+            docs = list(
+                db.collection("aiDetectionRetries")
+                .where("status", "==", "queued")
+                .limit(10)
+                .stream()
+            )
+        except Exception as e:
+            print(f"⚠️ Retry queue read failed: {e}")
+            continue
+
+        for doc in docs:
+            data = doc.to_dict() or {}
+            chat_id = int(data.get("chatId") or 0)
+            chat_title = data.get("chatTitle") or "Unknown"
+            sender = data.get("sender") or "Unknown"
+            message_id = int(data.get("triggerMessageId") or 0)
+            attempts = int(data.get("attempts") or 0)
+
+            if not chat_id or not message_id:
+                doc.reference.set(
+                    {
+                        "status": "error",
+                        "lastError": "Invalid retry payload",
+                        "updatedAt": firestore.SERVER_TIMESTAMP,
+                    },
+                    merge=True,
+                )
+                continue
+
+            doc.reference.set(
+                {
+                    "status": "processing",
+                    "updatedAt": firestore.SERVER_TIMESTAMP,
+                },
+                merge=True,
+            )
+
+            action, needs_retry = await run_ai_pipeline(chat_id, chat_title)
+            if needs_retry:
+                doc.reference.set(
+                    {
+                        "status": "queued",
+                        "attempts": attempts + 1,
+                        "lastError": "Ilmu upstream timeout/unavailable",
+                        "updatedAt": firestore.SERVER_TIMESTAMP,
+                    },
+                    merge=True,
+                )
+                continue
+
+            if action is None:
+                doc.reference.set(
+                    {
+                        "status": "no_action",
+                        "attempts": attempts + 1,
+                        "updatedAt": firestore.SERVER_TIMESTAMP,
+                    },
+                    merge=True,
+                )
+                continue
+
+            req_type = action.get("type")
+            payload = action.get("payload", {})
+            if not req_type or not payload:
+                doc.reference.set(
+                    {
+                        "status": "error",
+                        "attempts": attempts + 1,
+                        "lastError": "AI output missing type/payload",
+                        "updatedAt": firestore.SERVER_TIMESTAMP,
+                    },
+                    merge=True,
+                )
+                continue
+
+            task_id = await save_pending_task(
+                req_type=req_type,
+                payload=payload,
+                chat_id=chat_id,
+                chat_title=chat_title,
+                sender=sender,
+                message_id=message_id,
+            )
+            if task_id:
+                doc.reference.set(
+                    {
+                        "status": "done",
+                        "attempts": attempts + 1,
+                        "pendingTaskId": task_id,
+                        "updatedAt": firestore.SERVER_TIMESTAMP,
+                    },
+                    merge=True,
+                )
+                print(
+                    f"📋 [RETRY->PENDING] Task '{req_type}' recovered from retry queue "
+                    f"(retryDoc={doc.id}, pendingTask={task_id})"
+                )
+            else:
+                doc.reference.set(
+                    {
+                        "status": "queued",
+                        "attempts": attempts + 1,
+                        "lastError": "Failed to save pending task",
+                        "updatedAt": firestore.SERVER_TIMESTAMP,
+                    },
+                    merge=True,
+                )
 
    
 # =====================================================================
@@ -641,8 +831,28 @@ async def process_message(client, message):
         except Exception as e:
             print(f"⚠️ Error generating AI response: {e}")
     
-    # 3. Run AI on full chat history for task detection
-    action = await run_ai_pipeline(chat_id, chat_title)
+    # 3. Run AI on full chat history for task detection (optional)
+    if not ENABLE_AI_TASK_DETECTION:
+        print("ℹ️ AI task detection disabled; skipping Ilmu call.")
+        return
+
+    action, needs_retry = await run_ai_pipeline(chat_id, chat_title)
+    if needs_retry:
+        retry_id = await queue_detection_retry(
+            chat_id=chat_id,
+            chat_title=chat_title,
+            sender=sender,
+            message_id=message.id,
+            reason="Ilmu unavailable while processing message",
+        )
+        if retry_id:
+            print(
+                f"🕒 [RETRY-QUEUED] Ilmu unavailable; queued detection retry "
+                f"(retryDoc={retry_id}, messageId={message.id})"
+            )
+        else:
+            print("⚠️ Failed to queue detection retry (Firebase not configured?)")
+        return
 
     if action is not None:
         req_type = action.get("type")
@@ -724,10 +934,16 @@ async def main():
 
     # ── Register handler and start listening ──────────────────────────
     app.add_handler(MessageHandler(process_message))
+    retry_worker = asyncio.create_task(process_detection_retry_queue())
     ids = get_monitored_chat_ids()
     print(f"[BOT] Listening to {len(ids)} chat(s). Chat selection updates live. (Ctrl+C to stop)")
-    await idle()
-    await app.stop()
+    try:
+        await idle()
+    finally:
+        retry_worker.cancel()
+        with contextlib.suppress(asyncio.CancelledError):
+            await retry_worker
+        await app.stop()
 
 if __name__ == "__main__":
     _loop.run_until_complete(main())
