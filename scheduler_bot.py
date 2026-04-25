@@ -247,7 +247,7 @@ def _enqueue_automation_request_sync(
         "source": source,
     }
 
-    ref, _ = db.collection("automationRequests").add(doc)
+    _, ref = db.collection("automationRequests").add(doc)
     return ref.id
 
 
