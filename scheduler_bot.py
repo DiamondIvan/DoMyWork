@@ -1,11 +1,27 @@
+import io
 import os
+import sys
+
+# Force UTF-8 for all I/O on Windows (avoids cp1252 charmap errors with emojis).
+# Must be set before any other imports.
+os.environ.setdefault("PYTHONUTF8", "1")
+if hasattr(sys.stdout, "reconfigure"):
+    sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+if hasattr(sys.stderr, "reconfigure"):
+    sys.stderr.reconfigure(encoding="utf-8", errors="replace")
+
 import asyncio
 import json
 import hashlib
 from typing import Any, Optional
 import requests
-# Python 3.14 patch
-asyncio.set_event_loop(asyncio.new_event_loop())
+
+
+# Python 3.14 fix: create event loop before Pyrogram import,
+# because pyrogram/sync.py calls asyncio.get_event_loop() at import time.
+_loop = asyncio.new_event_loop()
+asyncio.set_event_loop(_loop)
+
 import base64
 try:
     from openai import OpenAI
@@ -17,25 +33,48 @@ from pyrogram.handlers import MessageHandler
 from env_config import get_env, get_env_int
 
 # =====================================================================
-# Telegram credentials# =====================================================================
+# Telegram credentials & session helpers
+# =====================================================================
 api_id = get_env_int("TELEGRAM_API_ID", fallback_names=["api_id"])
 api_hash = get_env("TELEGRAM_API_HASH", fallback_names=["api_hash"])
 session_name = get_env("PYROGRAM_SESSION_NAME", default="my_account")
-session_string = get_env("PYROGRAM_SESSION_STRING")
+_SESSION_FILE = os.path.join(os.path.dirname(__file__), "pyrogram_session.txt")
 
-if session_string:
-    app = Client(session_name, session_string=session_string)
-else:
-    if api_id is None or not api_hash:
-        raise RuntimeError(
-            "Missing Telegram credentials. Set TELEGRAM_API_ID and TELEGRAM_API_HASH in .env."
-        )
-    app = Client(session_name, api_id=api_id, api_hash=api_hash)
+def _read_session() -> Optional[str]:
+    """Read session string from file or .env, whichever is available."""
+    # Priority 1: pyrogram_session.txt (auto-written by the API on app sign-in)
+    try:
+        with open(_SESSION_FILE, "r", encoding="utf-8") as f:
+            val = f.read().strip()
+            if val:
+                return val
+    except FileNotFoundError:
+        pass
+    # Priority 2: PYROGRAM_SESSION_STRING in .env
+    return get_env("PYROGRAM_SESSION_STRING") or None
+
+# Global client — set in main() once the session is available
+app: Optional[Client] = None
+
 
 # =====================================================================
 # Target chats
 # =====================================================================
 GLOBAL_TARGET_IDS = []
+SELECTED_CHATS_FILE = os.path.join(os.path.dirname(__file__), "selected_chats.json")
+
+def get_monitored_chat_ids() -> list:
+    """Re-reads selected_chats.json every call so app changes take effect immediately."""
+    # 1. Try the JSON file (written by the mobile app)
+    try:
+        with open(SELECTED_CHATS_FILE, "r", encoding="utf-8") as f:
+            data = json.load(f)
+            if isinstance(data, list) and data:
+                return [int(x) for x in data]
+    except (FileNotFoundError, json.JSONDecodeError, ValueError):
+        pass
+    # 2. Fall back to in-memory list (set at startup from .env)
+    return list(GLOBAL_TARGET_IDS)
 
 # =====================================================================
 # Deduplication — skip images already processed this session
@@ -367,8 +406,12 @@ async def generate_ai_response(message_text: str, chat_title: str) -> Optional[s
 async def process_message(client, message):
     chat_id = message.chat.id
 
-    # Only process monitored chats
-    if chat_id not in GLOBAL_TARGET_IDS:
+    # Re-read selected chats on every message so app changes are live
+    monitored = get_monitored_chat_ids()
+    if not monitored:
+        # No chats selected yet — ignore everything silently
+        return
+    if chat_id not in monitored:
         return
 
     chat_title = message.chat.title or "Private DM"
@@ -506,44 +549,69 @@ async def process_message(client, message):
 # Entry point
 # =====================================================================
 async def main():
-    global GLOBAL_TARGET_IDS
+    global app, GLOBAL_TARGET_IDS
+
+    # ── Wait for session ──────────────────────────────────────────────
+    session = _read_session()
+    if not session:
+        print("[BOT] No Telegram session found.")
+        print("[BOT] Open the app → Settings → Telegram Connect to log in.")
+        print("[BOT] Waiting for pyrogram_session.txt to be created...")
+        while not (session := _read_session()):
+            await asyncio.sleep(3)
+        print("[BOT] Session detected! Connecting to Telegram...")
+    else:
+        print("[BOT] Session loaded. Connecting to Telegram...")
+
+    # ── Create and start client ───────────────────────────────────────
+    if not api_id or not api_hash:
+        print("[BOT] ERROR: TELEGRAM_API_ID or TELEGRAM_API_HASH missing in .env")
+        return
+
+    app = Client(
+        session_name,
+        session_string=session,
+        api_id=api_id,
+        api_hash=api_hash,
+    )
+    await app.start()
+    print("[BOT] Connected to Telegram!")
+
+    # ── Load .env chat IDs as in-memory fallback ──────────────────────
     env_ids = get_env("TARGET_CHAT_IDS")
     if env_ids:
         try:
             GLOBAL_TARGET_IDS = [int(x.strip()) for x in env_ids.split(",") if x.strip()]
+            print(f"[BOT] Loaded {len(GLOBAL_TARGET_IDS)} chat(s) from TARGET_CHAT_IDS in .env")
         except ValueError:
-            print("⚠️ Invalid format in TARGET_CHAT_IDS. Expected comma-separated integers.")
+            print("[BOT] WARN: Invalid TARGET_CHAT_IDS in .env — expected comma-separated integers.")
 
-    await app.start()
-
-    if not GLOBAL_TARGET_IDS:
-        print("\n⚠️ TARGET_CHAT_IDS not found in .env. Fetching your recent chats...")
+    # ── Wait for chat selection if none yet ───────────────────────────
+    if not get_monitored_chat_ids():
+        print("[BOT] No chats selected yet. Fetching your recent dialogs...")
         from pyrogram.enums import ChatType
         print("=" * 60)
         async for dialog in app.get_dialogs():
             if dialog.chat.type in [ChatType.GROUP, ChatType.SUPERGROUP, ChatType.PRIVATE]:
-                name = dialog.chat.title or dialog.chat.first_name
-                if dialog.chat.last_name:
+                name = dialog.chat.title or getattr(dialog.chat, "first_name", "") or "Unknown"
+                if getattr(dialog.chat, "last_name", None):
                     name += f" {dialog.chat.last_name}"
                 tag = "[DM]" if dialog.chat.type == ChatType.PRIVATE else "[GROUP]"
-                print(f"{tag} {name}: {dialog.chat.id}")
+                print(f"  {tag} {name:40s} id={dialog.chat.id}")
         print("=" * 60)
+        print("[BOT] Open the app → Settings → Monitored Chats and select chats.")
+        print("[BOT] Polling every 5 s until a selection is saved...")
+        while not get_monitored_chat_ids():
+            await asyncio.sleep(5)
+        ids = get_monitored_chat_ids()
+        print(f"[BOT] Selection saved! Monitoring {len(ids)} chat(s): {ids}")
 
-        selected = await asyncio.to_thread(
-            input,
-            "\n📝 Enter the IDs of the chats you want to monitor (comma-separated):\n(Tip: Add TARGET_CHAT_IDS=id1,id2 to your .env to skip this next time)\n> "
-        )
-
-        if selected.strip():
-            GLOBAL_TARGET_IDS = [int(x.strip()) for x in selected.split(",") if x.strip()]
-        else:
-            print("❌ No IDs entered. Exiting...")
-            await app.stop()
-            return
-
+    # ── Register handler and start listening ──────────────────────────
     app.add_handler(MessageHandler(process_message))
-    print(f"\n🤖 DoMyWork is listening to {len(GLOBAL_TARGET_IDS)} chat(s)... (Ctrl+C to stop)")
+    ids = get_monitored_chat_ids()
+    print(f"[BOT] Listening to {len(ids)} chat(s). Chat selection updates live. (Ctrl+C to stop)")
     await idle()
     await app.stop()
+
 if __name__ == "__main__":
-    app.run(main())
+    _loop.run_until_complete(main())

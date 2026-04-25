@@ -1,4 +1,5 @@
 import io
+import json
 import os
 import sys
 
@@ -28,6 +29,23 @@ app.add_middleware(
 
 # In-memory storage for active authentication flows
 auth_clients = {}
+
+# File that persists which chat IDs the bot should monitor
+SELECTED_CHATS_FILE = os.path.join(os.path.dirname(__file__), "selected_chats.json")
+
+def _load_selected_chats() -> list:
+    """Load the persisted chat selection from disk."""
+    try:
+        with open(SELECTED_CHATS_FILE, "r", encoding="utf-8") as f:
+            data = json.load(f)
+            return data if isinstance(data, list) else []
+    except (FileNotFoundError, json.JSONDecodeError):
+        return []
+
+def _save_selected_chats(chat_ids: list) -> None:
+    """Persist the chat selection to disk."""
+    with open(SELECTED_CHATS_FILE, "w", encoding="utf-8") as f:
+        json.dump(chat_ids, f)
 
 from typing import Optional
 from pyrogram.errors import SessionPasswordNeeded
@@ -131,7 +149,12 @@ async def sign_in(req: SignInReq):
 
         # Export the string session so scheduler_bot.py can use it without logging in again
         session_string = await client.export_session_string()
-        print(f"\n[OK] Successfully logged in! Add this to your .env file:\nPYROGRAM_SESSION_STRING={session_string}\n")
+
+        # Automatically write to pyrogram_session.txt so the bot picks it up without .env editing
+        session_file = os.path.join(os.path.dirname(__file__), "pyrogram_session.txt")
+        with open(session_file, "w", encoding="utf-8") as f:
+            f.write(session_string)
+        print(f"\n[OK] Session saved to pyrogram_session.txt — bot will use it automatically.")
 
         await client.disconnect()
         del auth_clients[req.userId]
@@ -139,6 +162,55 @@ async def sign_in(req: SignInReq):
         return {"status": "success", "sessionString": session_string}
     except Exception as e:
         raise HTTPException(status_code=400, detail=str(e))
+
+# =====================================================================
+# Chat selection endpoints
+# =====================================================================
+
+class FetchChatsReq(BaseModel):
+    sessionString: str
+
+class SetSelectedChatsReq(BaseModel):
+    chatIds: list[int]
+
+@app.post("/telegram/fetchChats")
+async def fetch_chats_for_selection(req: FetchChatsReq):
+    """Fetch the user's recent chats so they can pick which ones to monitor."""
+    if not req.sessionString:
+        raise HTTPException(status_code=400, detail="Missing sessionString")
+    try:
+        client = Client("picker_client", session_string=req.sessionString, in_memory=True,
+                        api_id=api_id, api_hash=api_hash)
+        await client.connect()
+        chats = []
+        async for dialog in client.get_dialogs(limit=50):
+            chat = dialog.chat
+            name = (
+                getattr(chat, "title", None)
+                or f"{getattr(chat, 'first_name', '')} {getattr(chat, 'last_name', '')}".strip()
+                or "Unknown"
+            )
+            chats.append({
+                "id": chat.id,
+                "name": name,
+                "type": str(chat.type),
+                "lastMessage": dialog.top_message.text[:80] if dialog.top_message and dialog.top_message.text else None,
+            })
+        await client.disconnect()
+        return {"chats": chats}
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=f"Failed to fetch chats: {str(e)}")
+
+@app.get("/telegram/selectedChats")
+def get_selected_chats():
+    """Return the currently saved list of monitored chat IDs."""
+    return {"chatIds": _load_selected_chats()}
+
+@app.post("/telegram/selectedChats")
+def set_selected_chats(req: SetSelectedChatsReq):
+    """Persist the user's chosen chat IDs and return them."""
+    _save_selected_chats(req.chatIds)
+    return {"chatIds": req.chatIds, "saved": True}
 
 # =====================================================================
 # Telegram Message Operations

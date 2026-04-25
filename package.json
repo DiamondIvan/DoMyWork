@@ -4,12 +4,13 @@
   "version": "1.0.0",
   "scripts": {
     "api": ".venv\\Scripts\\uvicorn telegram_api:app --reload --host 0.0.0.0 --port 8000",
-    "dev": "concurrently --names \"api,expo\" --prefix-colors \"cyan,magenta\" \"npm run api\" \"expo start\"",
-    "start": "concurrently --names \"api,expo\" --prefix-colors \"cyan,magenta\" \"npm run api\" \"expo start\"",
+    "bot": ".venv\\Scripts\\python.exe -X utf8 -u scheduler_bot.py",
+    "dev": "concurrently --names \"api,bot,expo\" --prefix-colors \"cyan,yellow,magenta\" \"npm run api\" \"npm run bot\" \"expo start\"",
+    "start": "concurrently --names \"api,bot,expo\" --prefix-colors \"cyan,yellow,magenta\" \"npm run api\" \"npm run bot\" \"expo start\"",
     "reset-project": "node ./scripts/reset-project.js",
-    "android": "concurrently --names \"api,expo\" --prefix-colors \"cyan,magenta\" \"npm run api\" \"expo start --android\"",
-    "ios": "concurrently --names \"api,expo\" --prefix-colors \"cyan,magenta\" \"npm run api\" \"expo start --ios\"",
-    "web": "concurrently --names \"api,expo\" --prefix-colors \"cyan,magenta\" \"npm run api\" \"expo start --web\"",
+    "android": "concurrently --names \"api,bot,expo\" --prefix-colors \"cyan,yellow,magenta\" \"npm run api\" \"npm run bot\" \"expo start --android\"",
+    "ios": "concurrently --names \"api,bot,expo\" --prefix-colors \"cyan,yellow,magenta\" \"npm run api\" \"npm run bot\" \"expo start --ios\"",
+    "web": "concurrently --names \"api,bot,expo\" --prefix-colors \"cyan,yellow,magenta\" \"npm run api\" \"npm run bot\" \"expo start --web\"",
     "lint": "expo lint"
   },
   "dependencies": {

@@ -44,6 +44,10 @@ yarn-error.*
 .env*.local
 secrets/*.json
 
+# Telegram bot session & chat selection (auto-generated, sensitive)
+pyrogram_session.txt
+selected_chats.json
+
 # Firebase
 /firebase/functions/node_modules/
 /firebase/functions/lib/

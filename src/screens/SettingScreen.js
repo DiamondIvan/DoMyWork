@@ -46,11 +46,26 @@ export default function SettingScreen() {
   const [isTelegramLoading, setIsTelegramLoading] = useState(false);
   const [savedSessionString, setSavedSessionString] = useState(null);
 
-  // Load any previously saved Telegram session on mount
+  // ── Chat Picker States ──
+  const [chatList, setChatList] = useState([]);
+  const [selectedChatIds, setSelectedChatIds] = useState(new Set());
+  const [isFetchingChats, setIsFetchingChats] = useState(false);
+  const [chatSaveStatus, setChatSaveStatus] = useState("");
+
+  // Load saved session + previously selected chat IDs on mount
   useEffect(() => {
     AsyncStorage.getItem("crow.telegram.sessionString").then((val) => {
       if (val) setSavedSessionString(val);
     });
+    // Load previously saved selection from the backend
+    fetch(`${"http://10.167.66.131:8000"}/telegram/selectedChats`)
+      .then((r) => r.json())
+      .then((json) => {
+        if (Array.isArray(json.chatIds)) {
+          setSelectedChatIds(new Set(json.chatIds));
+        }
+      })
+      .catch(() => {});
   }, []);
 
   const googleClientId = process.env.EXPO_PUBLIC_GOOGLE_OAUTH_CLIENT_ID ?? "";
@@ -188,6 +203,51 @@ export default function SettingScreen() {
       setTelegramStatus(error?.message ?? "Failed to reach backend.");
     } finally {
       setIsTelegramLoading(false);
+    }
+  };
+
+  // ── Chat Picker Handlers ──
+  const fetchChatsForPicker = async () => {
+    if (!savedSessionString) return;
+    setIsFetchingChats(true);
+    setChatSaveStatus("");
+    try {
+      const res = await fetch(`${functionsBaseUrl}/telegram/fetchChats`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ sessionString: savedSessionString }),
+      });
+      const json = await res.json().catch(() => null);
+      if (!res.ok) {
+        setChatSaveStatus(json?.detail ?? "Failed to load chats.");
+        return;
+      }
+      setChatList(json.chats ?? []);
+    } catch (e) {
+      setChatSaveStatus(e?.message ?? "Network error.");
+    } finally {
+      setIsFetchingChats(false);
+    }
+  };
+
+  const toggleChatSelection = async (chatId) => {
+    const next = new Set(selectedChatIds);
+    if (next.has(chatId)) {
+      next.delete(chatId);
+    } else {
+      next.add(chatId);
+    }
+    setSelectedChatIds(next);
+    // Persist immediately
+    try {
+      await fetch(`${functionsBaseUrl}/telegram/selectedChats`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ chatIds: Array.from(next) }),
+      });
+      setChatSaveStatus(`${next.size} chat(s) selected — bot will listen to these.`);
+    } catch {
+      setChatSaveStatus("Could not save selection.");
     }
   };
 
@@ -507,6 +567,67 @@ export default function SettingScreen() {
           )}
         </View>
 
+        {/* ── Chat Picker ── */}
+        {savedSessionString && (
+          <>
+            <Text style={styles.sectionTitle}>Monitored Chats</Text>
+            <View style={styles.cardPlain}>
+              <Text style={styles.chatPickerHint}>
+                Choose which chats the AI bot listens to. Only messages from selected chats use AI tokens.
+              </Text>
+              <Pressable
+                onPress={fetchChatsForPicker}
+                disabled={isFetchingChats}
+                style={({ pressed }) => [
+                  styles.connectGoogleBtn,
+                  { opacity: isFetchingChats ? 0.6 : pressed ? 0.85 : 1, marginTop: 10 },
+                ]}
+              >
+                <Text style={styles.connectGoogleText}>
+                  {isFetchingChats ? "Loading chats..." : chatList.length > 0 ? "Refresh Chat List" : "Load My Chats"}
+                </Text>
+              </Pressable>
+
+              {chatList.length > 0 && (
+                <View style={{ marginTop: 12 }}>
+                  {chatList.map((chat) => {
+                    const isSelected = selectedChatIds.has(chat.id);
+                    return (
+                      <TouchableOpacity
+                        key={chat.id}
+                        style={[styles.chatRow, isSelected && styles.chatRowSelected]}
+                        onPress={() => toggleChatSelection(chat.id)}
+                        activeOpacity={0.7}
+                      >
+                        <View style={styles.chatCheckbox}>
+                          {isSelected && <View style={styles.chatCheckboxInner} />}
+                        </View>
+                        <View style={{ flex: 1 }}>
+                          <Text style={[styles.chatName, isSelected && styles.chatNameSelected]}>
+                            {chat.name}
+                          </Text>
+                          {chat.lastMessage ? (
+                            <Text style={styles.chatLastMsg} numberOfLines={1}>
+                              {chat.lastMessage}
+                            </Text>
+                          ) : null}
+                        </View>
+                        <Text style={styles.chatTypeTag}>
+                          {chat.type?.includes("group") || chat.type?.includes("super") ? "GROUP" : "DM"}
+                        </Text>
+                      </TouchableOpacity>
+                    );
+                  })}
+                </View>
+              )}
+
+              {!!chatSaveStatus && (
+                <Text style={styles.statusText}>{chatSaveStatus}</Text>
+              )}
+            </View>
+          </>
+        )}
+
         <Text style={styles.sectionTitle}>AI Agent Personalization</Text>
         <View style={styles.card}>
           <View style={styles.personalizationRow}>
@@ -796,6 +917,65 @@ const styles = StyleSheet.create({
     color: "#065f46",
     fontWeight: "700",
     fontSize: 12,
+  },
+  chatPickerHint: {
+    fontSize: 12,
+    color: COLORS.textGray,
+    lineHeight: 17,
+  },
+  chatRow: {
+    flexDirection: "row",
+    alignItems: "center",
+    gap: 10,
+    paddingVertical: 10,
+    paddingHorizontal: 10,
+    borderRadius: 8,
+    marginBottom: 6,
+    backgroundColor: "#f8fafc",
+    borderWidth: 1,
+    borderColor: "#e2e8f0",
+  },
+  chatRowSelected: {
+    backgroundColor: "#eff6ff",
+    borderColor: COLORS.primary,
+  },
+  chatCheckbox: {
+    width: 20,
+    height: 20,
+    borderRadius: 4,
+    borderWidth: 2,
+    borderColor: "#cbd5e1",
+    alignItems: "center",
+    justifyContent: "center",
+    backgroundColor: "#fff",
+  },
+  chatCheckboxInner: {
+    width: 11,
+    height: 11,
+    borderRadius: 2,
+    backgroundColor: COLORS.primary,
+  },
+  chatName: {
+    fontSize: 13,
+    fontWeight: "600",
+    color: COLORS.darkGray,
+  },
+  chatNameSelected: {
+    color: COLORS.primary,
+  },
+  chatLastMsg: {
+    fontSize: 11,
+    color: COLORS.textGray,
+    marginTop: 2,
+  },
+  chatTypeTag: {
+    fontSize: 10,
+    fontWeight: "700",
+    color: COLORS.textGray,
+    backgroundColor: "#f1f5f9",
+    paddingHorizontal: 6,
+    paddingVertical: 2,
+    borderRadius: 4,
   },
   modalBackdrop: {
     flex: 1,
