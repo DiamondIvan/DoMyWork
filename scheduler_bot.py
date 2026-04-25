@@ -15,6 +15,7 @@ import json
 import hashlib
 from typing import Any, Optional
 import requests
+from requests.exceptions import ReadTimeout, ConnectionError as RequestsConnectionError
 
 
 # Python 3.14 fix: create event loop before Pyrogram import,
@@ -129,6 +130,8 @@ OWNER_USER_ID = (
 ILMU_API_KEY = get_env("ILMU_API_KEY") or get_env("API_KEY") or get_env("OPENAI_API_KEY")
 ILMU_BASE_URL = get_env("ILMU_BASE_URL", default="https://api.ilmu.ai/v1/chat/completions")
 ILMU_MODEL = get_env("ILMU_MODEL", default="ilmu-glm-5.1")
+ILMU_TIMEOUT_SECONDS = get_env_int("ILMU_TIMEOUT_SECONDS", fallback_names=["ILMU_TIMEOUT"], default=120)
+ILMU_MAX_RETRIES = get_env_int("ILMU_MAX_RETRIES", default=2)
 
 def call_ilmu_ai(system_prompt: str, user_content: str) -> Optional[str]:
     """Helper to call Ilmu AI via HTTP requests."""
@@ -149,15 +152,33 @@ def call_ilmu_ai(system_prompt: str, user_content: str) -> Optional[str]:
         "stream": False,
         "temperature": 0.1  # Low temperature for strict JSON output
     }
-    try:
-        response = requests.post(ILMU_BASE_URL, headers=headers, json=payload, timeout=60)
-        if response.status_code == 200:
-            return response.json()['choices'][0]['message']['content'].strip()
-        print(f"⚠️ Ilmu API Error {response.status_code}: {response.text}")
-        return None
-    except Exception as e:
-        print(f"❌ Ilmu Request Failed: {e}")
-        return None
+    attempts = max(1, ILMU_MAX_RETRIES + 1)
+    for attempt in range(1, attempts + 1):
+        try:
+            response = requests.post(
+                ILMU_BASE_URL,
+                headers=headers,
+                json=payload,
+                timeout=max(30, ILMU_TIMEOUT_SECONDS),
+            )
+            if response.status_code == 200:
+                return response.json()["choices"][0]["message"]["content"].strip()
+
+            print(f"⚠️ Ilmu API Error {response.status_code}: {response.text}")
+            return None
+        except (ReadTimeout, RequestsConnectionError) as e:
+            if attempt >= attempts:
+                print(f"❌ Ilmu Request Failed after {attempt} attempt(s): {e}")
+                return None
+            backoff_seconds = attempt * 2
+            print(
+                f"⚠️ Ilmu transient network issue on attempt {attempt}/{attempts}; retrying in {backoff_seconds}s... ({e})"
+            )
+            import time
+            time.sleep(backoff_seconds)
+        except Exception as e:
+            print(f"❌ Ilmu Request Failed: {e}")
+            return None
 
 # =====================================================================
 # GPT-4o-mini Integration (Replacement for Ilmu/Gemini)
