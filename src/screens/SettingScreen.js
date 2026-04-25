@@ -1,6 +1,7 @@
 import * as AuthSession from "expo-auth-session";
 import * as WebBrowser from "expo-web-browser";
 import { useEffect, useMemo, useState } from "react";
+import AsyncStorage from "@react-native-async-storage/async-storage";
 import {
   Alert,
   Image,
@@ -34,10 +35,26 @@ export default function SettingScreen() {
   const [aboutOpen, setAboutOpen] = useState(false);
   const [notificationStatusText, setNotificationStatusText] = useState("");
   const { state, actions } = useActivityStore();
+
+  // ── Telegram Auth States ──
+  const [telegramPhone, setTelegramPhone] = useState("");
+  const [telegramCode, setTelegramCode] = useState("");
+  const [telegramPassword, setTelegramPassword] = useState("");
+  const [isPasswordNeeded, setIsPasswordNeeded] = useState(false);
+  const [telegramPhoneCodeHash, setTelegramPhoneCodeHash] = useState(null);
+  const [telegramStatus, setTelegramStatus] = useState("");
+  const [isTelegramLoading, setIsTelegramLoading] = useState(false);
+  const [savedSessionString, setSavedSessionString] = useState(null);
+
+  // Load any previously saved Telegram session on mount
+  useEffect(() => {
+    AsyncStorage.getItem("crow.telegram.sessionString").then((val) => {
+      if (val) setSavedSessionString(val);
+    });
+  }, []);
+
   const googleClientId = process.env.EXPO_PUBLIC_GOOGLE_OAUTH_CLIENT_ID ?? "";
-  const functionsBaseUrl = (
-    process.env.EXPO_PUBLIC_FUNCTIONS_BASE_URL ?? ""
-  ).replace(/\/$/, "");
+  const functionsBaseUrl = "http://10.167.66.131:8000";
   const redirectUri = useMemo(() => {
     const rawUri =
       process.env.EXPO_PUBLIC_GOOGLE_OAUTH_REDIRECT_URI ??
@@ -138,6 +155,102 @@ export default function SettingScreen() {
     }
   };
 
+  // ── Telegram Auth Handlers ──
+  const sendTelegramCode = async () => {
+    setTelegramStatus("");
+    if (!telegramPhone.trim()) {
+      setTelegramStatus("Please enter your phone number with country code (e.g. +60123456789).");
+      return;
+    }
+    if (!functionsBaseUrl) {
+      setTelegramStatus("Missing EXPO_PUBLIC_FUNCTIONS_BASE_URL");
+      return;
+    }
+
+    setIsTelegramLoading(true);
+    try {
+      const res = await fetch(`${functionsBaseUrl}/telegram/sendCode`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          userId: (userId || defaultUserId || "default").trim(),
+          phoneNumber: telegramPhone.trim(),
+        }),
+      });
+      const json = await res.json().catch(() => null);
+      if (!res.ok) {
+        setTelegramStatus(json?.detail ?? `Failed to send code (${res.status}).`);
+        return;
+      }
+      setTelegramPhoneCodeHash(json.phoneCodeHash);
+      setTelegramStatus("✅ Code sent! Check your Telegram app and enter the code below.");
+    } catch (error) {
+      setTelegramStatus(error?.message ?? "Failed to reach backend.");
+    } finally {
+      setIsTelegramLoading(false);
+    }
+  };
+
+  const signInTelegram = async () => {
+    setTelegramStatus("");
+    if (!isPasswordNeeded && !telegramCode.trim()) {
+      setTelegramStatus("Please enter the verification code.");
+      return;
+    }
+    if (isPasswordNeeded && !telegramPassword.trim()) {
+      setTelegramStatus("Please enter your 2FA password.");
+      return;
+    }
+    if (!telegramPhoneCodeHash) {
+      setTelegramStatus("Please request a code first.");
+      return;
+    }
+
+    setIsTelegramLoading(true);
+    try {
+      const res = await fetch(`${functionsBaseUrl}/telegram/signIn`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          userId: (userId || defaultUserId || "default").trim(),
+          phoneNumber: telegramPhone.trim(),
+          phoneCodeHash: telegramPhoneCodeHash,
+          phoneCode: telegramCode.trim(),
+          password: isPasswordNeeded ? telegramPassword : null,
+        }),
+      });
+      const json = await res.json().catch(() => null);
+      if (!res.ok) {
+        setTelegramStatus(json?.detail ?? `Sign-in failed (${res.status}).`);
+        return;
+      }
+
+      if (json.status === "password_needed") {
+        setIsPasswordNeeded(true);
+        setTelegramStatus(json.detail || "Two-step verification enabled. Please enter your password.");
+        return;
+      }
+
+      // Save session string to AsyncStorage so the whole app can use it
+      if (json.sessionString) {
+        await AsyncStorage.setItem("crow.telegram.sessionString", json.sessionString);
+        setSavedSessionString(json.sessionString);
+      }
+
+      setTelegramStatus(
+        "Telegram connected! Session saved — the app can now access your Telegram."
+      );
+      setTelegramPhoneCodeHash(null);
+      setIsPasswordNeeded(false);
+      setTelegramCode("");
+      setTelegramPassword("");
+    } catch (error) {
+      setTelegramStatus(error?.message ?? "Failed to reach backend.");
+    } finally {
+      setIsTelegramLoading(false);
+    }
+  };
+
   const connectGoogle = async () => {
     setStatusText("");
     if (!googleClientId) {
@@ -213,14 +326,18 @@ export default function SettingScreen() {
       const res = await ensureNotificationPermission();
       if (!res.granted) {
         actions.setNotificationsEnabled(false);
-        setNotificationStatusText("Permission not granted. Enable in device settings.");
+        setNotificationStatusText(
+          "Permission not granted. Enable in device settings.",
+        );
         return;
       }
       actions.setNotificationsEnabled(true);
       setNotificationStatusText("Notifications enabled.");
     } catch (e) {
       actions.setNotificationsEnabled(false);
-      setNotificationStatusText(e?.message ?? "Failed to enable notifications.");
+      setNotificationStatusText(
+        e?.message ?? "Failed to enable notifications.",
+      );
     }
   };
 
@@ -307,6 +424,89 @@ export default function SettingScreen() {
           )}
         </View>
 
+        <Text style={styles.sectionTitle}>Telegram Connect</Text>
+        <View style={styles.cardPlain}>
+          <TextInput
+            style={styles.userIdInput}
+            value={telegramPhone}
+            onChangeText={setTelegramPhone}
+            placeholder="Phone number with country code (e.g. +60123456789)"
+            placeholderTextColor="#94a3b8"
+            autoCapitalize="none"
+            keyboardType="phone-pad"
+          />
+          <Pressable
+            disabled={isTelegramLoading}
+            onPress={sendTelegramCode}
+            style={({ pressed }) => [
+              styles.connectGoogleBtn,
+              { opacity: isTelegramLoading ? 0.6 : pressed ? 0.85 : 1 },
+            ]}
+          >
+            <Text style={styles.connectGoogleText}>
+              {isTelegramLoading && !telegramPhoneCodeHash
+                ? "Sending code..."
+                : "Send Verification Code"}
+            </Text>
+          </Pressable>
+
+          {telegramPhoneCodeHash && (
+            <>
+              <TextInput
+                style={[styles.userIdInput, { marginTop: 10 }]}
+                value={telegramCode}
+                onChangeText={setTelegramCode}
+                placeholder="Enter the code from Telegram"
+                placeholderTextColor="#94a3b8"
+                autoCapitalize="none"
+                keyboardType="number-pad"
+                editable={!isPasswordNeeded}
+              />
+
+              {isPasswordNeeded && (
+                <>
+                  <View style={styles.twofaBanner}>
+                    <Text style={styles.twofaIcon}>🔐</Text>
+                    <Text style={styles.twofaText}>
+                      Two-step verification is enabled. Enter your Telegram password below.
+                    </Text>
+                  </View>
+                  <TextInput
+                    style={[styles.userIdInput, { marginTop: 6 }]}
+                    value={telegramPassword}
+                    onChangeText={setTelegramPassword}
+                    placeholder="Enter your 2FA password"
+                    placeholderTextColor="#94a3b8"
+                    secureTextEntry
+                    autoCapitalize="none"
+                    autoFocus
+                  />
+                </>
+              )}
+              <Pressable
+                disabled={isTelegramLoading}
+                onPress={signInTelegram}
+                style={({ pressed }) => [
+                  styles.connectGoogleBtn,
+                  { opacity: isTelegramLoading ? 0.6 : pressed ? 0.85 : 1 },
+                ]}
+              >
+                <Text style={styles.connectGoogleText}>
+                  {isTelegramLoading ? "Signing in..." : "Verify & Connect Telegram"}
+                </Text>
+              </Pressable>
+            </>
+          )}
+
+          {!!telegramStatus && <Text style={styles.statusText}>{telegramStatus}</Text>}
+
+          {savedSessionString && (
+            <View style={styles.connectedBadge}>
+              <Text style={styles.connectedBadgeText}>Connected to Telegram</Text>
+            </View>
+          )}
+        </View>
+
         <Text style={styles.sectionTitle}>AI Agent Personalization</Text>
         <View style={styles.card}>
           <View style={styles.personalizationRow}>
@@ -341,7 +541,10 @@ export default function SettingScreen() {
               <Text style={styles.arrow}>›</Text>
             </TouchableOpacity>
           ))}
-          <TouchableOpacity style={styles.row} onPress={() => setAboutOpen(true)}>
+          <TouchableOpacity
+            style={styles.row}
+            onPress={() => setAboutOpen(true)}
+          >
             <Text style={styles.supportText}>About Crow AI</Text>
             <Text style={styles.arrow}>›</Text>
           </TouchableOpacity>
@@ -364,8 +567,8 @@ export default function SettingScreen() {
           <View style={styles.modalCard}>
             <Text style={styles.modalTitle}>About Crow AI</Text>
             <Text style={styles.modalBody}>
-              Crow AI helps you turn messages into activities, manage your to-do and due items,
-              and keep a clean history of what you’ve finished.
+              Crow AI helps you turn messages into activities, manage your to-do
+              and due items, and keep a clean history of what you’ve finished.
             </Text>
             <TouchableOpacity
               style={styles.modalCloseBtn}
@@ -550,10 +753,49 @@ const styles = StyleSheet.create({
     fontSize: 12,
     fontWeight: "600",
   },
+  twofaBanner: {
+    flexDirection: "row",
+    alignItems: "flex-start",
+    backgroundColor: "#fffbeb",
+    borderWidth: 1,
+    borderColor: "#fcd34d",
+    borderRadius: 8,
+    paddingHorizontal: 10,
+    paddingVertical: 8,
+    marginTop: 8,
+    marginBottom: 2,
+    gap: 6,
+  },
+  twofaIcon: {
+    fontSize: 14,
+    lineHeight: 18,
+  },
+  twofaText: {
+    flex: 1,
+    fontSize: 12,
+    color: "#92400e",
+    fontWeight: "500",
+    lineHeight: 17,
+  },
   statusSubText: {
     marginTop: 6,
     color: COLORS.textGray,
     fontSize: 11,
+  },
+  connectedBadge: {
+    marginTop: 10,
+    backgroundColor: "#ecfdf5",
+    borderWidth: 1,
+    borderColor: "#6ee7b7",
+    borderRadius: 8,
+    paddingHorizontal: 12,
+    paddingVertical: 8,
+    alignItems: "center",
+  },
+  connectedBadgeText: {
+    color: "#065f46",
+    fontWeight: "700",
+    fontSize: 12,
   },
   modalBackdrop: {
     flex: 1,

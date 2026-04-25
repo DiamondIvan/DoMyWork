@@ -7,7 +7,10 @@ import requests
 # Python 3.14 patch
 asyncio.set_event_loop(asyncio.new_event_loop())
 import base64
-from openai import OpenAI # Ensure this is at the top
+try:
+    from openai import OpenAI
+except Exception:
+    OpenAI = None
 from pyrogram import Client, idle
 from pyrogram.handlers import MessageHandler
 
@@ -30,9 +33,9 @@ else:
     app = Client(session_name, api_id=api_id, api_hash=api_hash)
 
 # =====================================================================
-# Target chats — paste IDs from get_id.py here
+# Target chats
 # =====================================================================
-GLOBAL_TARGET_IDS = [-5100901072, -5121186491, -5126239079]
+GLOBAL_TARGET_IDS = []
 
 # =====================================================================
 # Deduplication — skip images already processed this session
@@ -75,17 +78,22 @@ def extract_document_text(file_path: str) -> str:
 # =====================================================================
 # Ilmu AI (Lazy Init Replacement for Gemini)
 # =====================================================================
-ILMU_API_KEY = "sk-b0ad8da654af17eb6c8cb5b1006be30c8ecb8c9e108dd875"
-ILMU_BASE_URL = "https://api.ilmu.ai/v1/chat/completions"
+ILMU_API_KEY = get_env("ILMU_API_KEY")
+ILMU_BASE_URL = get_env("ILMU_BASE_URL", default="https://api.ilmu.ai/v1/chat/completions")
+ILMU_MODEL = get_env("ILMU_MODEL", default="ilmu-glm-5.1")
 
 def call_ilmu_ai(system_prompt: str, user_content: str) -> Optional[str]:
     """Helper to call Ilmu AI via HTTP requests."""
+    if not ILMU_API_KEY:
+        print("❌ Missing ILMU_API_KEY in .env")
+        return None
+
     headers = {
         "Authorization": f"Bearer {ILMU_API_KEY}",
         "Content-Type": "application/json"
     }
     payload = {
-        "model": "ilmu-glm-5.1",
+        "model": ILMU_MODEL,
         "messages": [
             {"role": "system", "content": system_prompt},
             {"role": "user", "content": user_content}
@@ -107,11 +115,13 @@ def call_ilmu_ai(system_prompt: str, user_content: str) -> Optional[str]:
 # GPT-4o-mini Integration (Replacement for Ilmu/Gemini)
 # =====================================================================
 OPENAI_API_KEY = get_env("OPENAI_API_KEY")
-gpt_client = OpenAI(api_key=OPENAI_API_KEY)
+gpt_client = OpenAI(api_key=OPENAI_API_KEY) if OpenAI and OPENAI_API_KEY else None
 
 def describe_image_with_gpt(image_path: str) -> str:
     """Uses GPT-4o-mini to actually see and describe the image."""
     try:
+        if gpt_client is None:
+            return "(OpenAI client not configured)"
         with open(image_path, "rb") as image_file:
             base64_image = base64.b64encode(image_file.read()).decode('utf-8')
 
@@ -130,6 +140,11 @@ def describe_image_with_gpt(image_path: str) -> str:
     except Exception as e:
         print(f"❌ [GPT VISION ERROR]: {e}")
         return "(Image received - failed to describe)"
+# =====================================================================
+# Configuration: Enable/disable interactive AI responses
+# =====================================================================
+ENABLE_AI_RESPONSES = get_env("ENABLE_TELEGRAM_AI_RESPONSES", default="true").lower() in ["true", "1", "yes"]
+
 # =====================================================================
 # Firestore (lazy init)
 # =====================================================================
@@ -223,18 +238,21 @@ async def save_message(**kwargs) -> None:
 # =====================================================================
 # Fetch ALL messages for a chat from Firestore (ordered by timestamp)
 # =====================================================================
-def _get_all_messages_sync(chat_id: int) -> list:
-    db, _ = _get_firestore()
+def _get_all_messages_sync(chat_id: int, limit: int = 20) -> list:
+    db, firestore_mod = _get_firestore()
     if db is None:
         return []
+    # Fetch only the latest messages to save AI tokens and prevent context overflow
     docs = (
         db.collection("chats")
         .document(str(chat_id))
         .collection("messages")
-        .order_by("timestamp")
+        .order_by("timestamp", direction=firestore_mod.Query.DESCENDING)
+        .limit(limit)
         .stream()
     )
-    return [d.to_dict() for d in docs]
+    # Reverse the list so the AI reads it in chronological order (oldest to newest)
+    return [d.to_dict() for d in docs][::-1]
 
 
 async def get_all_messages(chat_id: int) -> list:
@@ -294,12 +312,13 @@ async def run_ai_pipeline(chat_id: int, chat_title: str) -> Optional[dict]:
     )
     system_prompt = (
         f"You are a strict scheduling assistant for the Telegram chat '{chat_title}'. "
-        "Extract MANDATORY tasks: project meetings, deadlines, or emails. Ignore spam/ads. "
+        "Extract MANDATORY tasks (meetings, deadlines, emails) ONLY IF they are newly introduced or confirmed in the LATEST message. "
+        "Ignore spam/ads and ignore tasks that were already finalized in older messages. "
         "You MUST respond ONLY with a valid JSON object or the word 'null'."
     )
 
     user_content = f"""
-    Based on the following history, detect if a new mandatory task is needed:
+    Based on the following recent history, detect if a new mandatory task is needed from the final message:
     {history}
 
     Output format:
@@ -325,6 +344,22 @@ async def run_ai_pipeline(chat_id: int, chat_title: str) -> Optional[dict]:
     except Exception as e:
         print(f"⚠️ AI JSON Error: {e} | Raw Output: {raw}")
         return None
+
+# =====================================================================
+# Generate AI response for interactive chat
+# =====================================================================
+async def generate_ai_response(message_text: str, chat_title: str) -> Optional[str]:
+    """Generate a conversational AI response for a message."""
+    system_prompt = (
+        f"You are Crow AI, a helpful scheduling assistant in the Telegram chat '{chat_title}'. "
+        "Help users manage their tasks, calendar events, and reminders. "
+        "Be concise, friendly, and helpful. Keep responses under 200 characters when possible. "
+        "If the user asks you to create a task or event, acknowledge it and tell them you'll help."
+    )
+
+    raw = await asyncio.to_thread(call_ilmu_ai, system_prompt, message_text)
+    return raw if raw else None
+
    
 # =====================================================================
 # Core message handler
@@ -425,7 +460,22 @@ async def process_message(client, message):
         telegram_message_id=message.id,
     )
     print("💾 Message saved to Firestore.")
-    # 2. Run AI on full chat history
+    
+    # 2. Generate AI response if not an outgoing message and AI responses are enabled
+    if not message.outgoing and ENABLE_AI_RESPONSES and enriched_text:
+        try:
+            ai_response = await generate_ai_response(enriched_text, chat_title)
+            if ai_response:
+                print(f"🤖 [AI RESPONSE] {ai_response}")
+                try:
+                    await message.reply(ai_response)
+                    print("✅ AI response sent!")
+                except Exception as e:
+                    print(f"⚠️ Failed to send AI response: {e}")
+        except Exception as e:
+            print(f"⚠️ Error generating AI response: {e}")
+    
+    # 3. Run AI on full chat history for task detection
     action = await run_ai_pipeline(chat_id, chat_title)
 
     if action is not None:
@@ -456,12 +506,43 @@ async def process_message(client, message):
 # Entry point
 # =====================================================================
 async def main():
+    global GLOBAL_TARGET_IDS
+    env_ids = get_env("TARGET_CHAT_IDS")
+    if env_ids:
+        try:
+            GLOBAL_TARGET_IDS = [int(x.strip()) for x in env_ids.split(",") if x.strip()]
+        except ValueError:
+            print("⚠️ Invalid format in TARGET_CHAT_IDS. Expected comma-separated integers.")
+
+    await app.start()
+
     if not GLOBAL_TARGET_IDS:
-        print("⚠️ GLOBAL_TARGET_IDS is empty. Run get_id.py and add IDs first!")
-        return
+        print("\n⚠️ TARGET_CHAT_IDS not found in .env. Fetching your recent chats...")
+        from pyrogram.enums import ChatType
+        print("=" * 60)
+        async for dialog in app.get_dialogs():
+            if dialog.chat.type in [ChatType.GROUP, ChatType.SUPERGROUP, ChatType.PRIVATE]:
+                name = dialog.chat.title or dialog.chat.first_name
+                if dialog.chat.last_name:
+                    name += f" {dialog.chat.last_name}"
+                tag = "[DM]" if dialog.chat.type == ChatType.PRIVATE else "[GROUP]"
+                print(f"{tag} {name}: {dialog.chat.id}")
+        print("=" * 60)
+
+        selected = await asyncio.to_thread(
+            input,
+            "\n📝 Enter the IDs of the chats you want to monitor (comma-separated):\n(Tip: Add TARGET_CHAT_IDS=id1,id2 to your .env to skip this next time)\n> "
+        )
+
+        if selected.strip():
+            GLOBAL_TARGET_IDS = [int(x.strip()) for x in selected.split(",") if x.strip()]
+        else:
+            print("❌ No IDs entered. Exiting...")
+            await app.stop()
+            return
+
     app.add_handler(MessageHandler(process_message))
     print(f"\n🤖 DoMyWork is listening to {len(GLOBAL_TARGET_IDS)} chat(s)... (Ctrl+C to stop)")
-    await app.start()
     await idle()
     await app.stop()
 if __name__ == "__main__":

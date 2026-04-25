@@ -1,0 +1,10 @@
+name: Ilmu Config
+version: 1.0.0
+schema: v1
+
+models:
+  - name: Ilmu AI
+    provider: openai
+    model: ilmu-glm-5.1
+    apiBase: https://api.ilmu.ai/v1
+    apiKey: sk-b0ad8da654af17eb6c8cb5b1006be30c8ecb8c9e108dd875
