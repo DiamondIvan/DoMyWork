@@ -1,6 +1,6 @@
 # 📱 [CrowAI]
 
-> A brief, catchy description of what your app does and the problem it solves. 
+> Autonomous AI Agent That Turns Filter Unstructured Chat Messages Into Scheduled Tasks On Your Calendar
 
 ## 🎥 Demo Video
 Check out our project in action! 
